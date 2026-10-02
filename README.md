@@ -27,21 +27,20 @@
 
 - Plays `.swf` games and animations (ActionScript 1, 2 and 3), rendered on the PS5's GPU.
 - Library with **Recent**, **Games** and **Favorites** tabs, list or grid view, and covers taken automatically from your games.
-- **Saves** work: games that save progress keep it between sessions.
 - **Controls per game**: map any DualSense button to a key or a mouse click.
-- **On-screen keyboard** that opens by itself when a game asks for text.
+- **On-screen keyboard** L2 to run it, some games needs keyboard.
 - Ruffle's own player settings: quality, scale mode, letterbox, frame rate, player version and more.
 - Sound with MP3, AAC and Nellymoser support.
 
 ## Install
 
-You need a PS5 with **kstuff** running and a payload loader, plus **[ShadowMountPlus](https://github.com/drakmor/ShadowMountPlus)** (or another way to install app folders).
+You need a PS5 with **kstuff** running and a ruffle-helper, plus **[ShadowMountPlus](https://github.com/drakmor/ShadowMountPlus)**.
 
 Download the [latest release](https://github.com/ZiZc3/Ruffle-Flash-PS5/releases), then:
 
-1. Copy the **`PPSA68091`** folder to `/data/homebrew/PPSA68091`.
-2. Load **`ruffle-helper.elf`** together with kstuff (for example with your payload loader, or add it to `autoload.txt`).
-3. Put your games in `/data/ruffle/games/`.
+1. Copy the **`PPSA68091`** folder to `/data/homebrew/`.
+2. Load **`ruffle-helper.elf`** together with kstuff.
+3. Put all your games (.swf) in `/data/ruffle/games/`.
 4. Start **Ruffle Flash** from the home screen.
 
 > Games that come with extra files (folders like `db/` or `media/`) go in a folder of their own, with all their files, e.g. `/data/ruffle/games/Happy Wheels/`.
@@ -79,9 +78,9 @@ Download the [latest release](https://github.com/ZiZc3/Ruffle-Flash-PS5/releases
 
 | Path | What |
 |---|---|
-| `/data/ruffle/games/` | Your games (`.swf`), one folder deep is fine |
+| `/data/ruffle/games/` | Your games (`.swf`) |
 | `/data/ruffle/covers/` | Covers (`.png` / `.jpg`, named like the game) |
-| `/data/ruffle/saves/` | Game saves |
+| `/data/ruffle/saves/` | Game saves (only games that supported) |
 | `/data/ruffle/controls/` | Per-game controls |
 | `/data/ruffle/ruffle.log` | Log of the last session (attach it when reporting a problem) |
 
@@ -121,8 +120,6 @@ It downloads Ruffle, applies the patches, builds the app and writes `PPSA68091/`
 The helper builds with `make` in [`ruffle-helper/`](ruffle-helper) (needs `PS5_PAYLOAD_SDK`).
 
 ## Credits
-
-- **AZiZ**: PS5 port.
 - **[Ruffle](https://github.com/ruffle-rs/ruffle)** and its contributors: the Flash Player emulator.
 - **[Mihawk-99](https://github.com/mihawk-99)**: [PS5_Vulkan](https://github.com/mihawk-99/PS5_Vulkan), RADV on the PS5.
 - **[ps5-payload-dev SDK](https://github.com/ps5-payload-dev/sdk)**, **[kstuff](https://github.com/EchoStretch/kstuff)**, **[etaHEN](https://github.com/LightningMods/etaHEN)**, **[ShadowMountPlus](https://github.com/drakmor/ShadowMountPlus)** and the PS5 scene.

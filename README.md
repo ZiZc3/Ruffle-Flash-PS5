@@ -43,8 +43,6 @@ Download the [latest release](https://github.com/ZiZc3/Ruffle-Flash-PS5/releases
 3. Put all your games (.swf) in `/data/ruffle/games/`.
 4. Start **Ruffle Flash** from the home screen.
 
-> Games that come with extra files (folders like `db/` or `media/`) go in a folder of their own, with all their files, e.g. `/data/ruffle/games/Happy Wheels/`.
-
 ## Controls
 
 **Library**
@@ -83,6 +81,7 @@ Download the [latest release](https://github.com/ZiZc3/Ruffle-Flash-PS5/releases
 | `/data/ruffle/saves/` | Game saves (only games that supported) |
 | `/data/ruffle/controls/` | Per-game controls |
 | `/data/ruffle/ruffle.log` | Log of the last session (attach it when reporting a problem) |
+> Games that come with extra files (folders like `db/` or `media/`) go in a folder of their own, with all their files, e.g. `/data/ruffle/games/Happy Wheels/`.
 
 ## Good to know
 

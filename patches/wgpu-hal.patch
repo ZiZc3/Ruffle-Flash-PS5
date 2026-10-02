@@ -1,0 +1,114 @@
+--- a/src/vulkan/adapter.rs
++++ b/src/vulkan/adapter.rs
+@@ -2311,11 +2311,14 @@
+             if driver.conformance_version.major == 0 {
+                 if driver.driver_id == vk::DriverId::MOLTENVK {
+                     log::debug!("Adapter is not Vulkan compliant, but is MoltenVK, continuing");
+-                } else if self
+-                    .shared
+-                    .flags
+-                    .contains(wgt::InstanceFlags::ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER)
++                } else if cfg!(ps5)
++                    || self
++                        .shared
++                        .flags
++                        .contains(wgt::InstanceFlags::ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER)
+                 {
++                    // PS5: the console's RADV build reports no conformance
++                    // version, and it is the only GPU there is.
+                     log::debug!("Adapter is not Vulkan compliant: {}", info.name);
+                 } else {
+                     log::debug!(
+--- a/src/vulkan/instance.rs
++++ b/src/vulkan/instance.rs
+@@ -271,6 +271,11 @@
+             extensions.push(khr::get_physical_device_properties2::NAME);
+             extensions.push(khr::get_display_properties2::NAME);
+         }
++        #[cfg(ps5)]
++        {
++            extensions.push(khr::display::NAME);
++            extensions.push(khr::surface::NAME);
++        }
+ 
+         if flags.contains(wgt::InstanceFlags::DEBUG) {
+             // VK_EXT_debug_utils
+@@ -545,7 +550,7 @@
+         Ok(self.create_surface_from_vk_surface_khr(surface, None))
+     }
+ 
+-    pub(super) fn create_surface_from_vk_surface_khr(
++    pub fn create_surface_from_vk_surface_khr(
+         &self,
+         surface: vk::SurfaceKHR,
+         hwnd: Option<crate::vulkan::swapchain::WindowHandle>,
+@@ -575,17 +580,34 @@
+ 
+         let entry = unsafe {
+             profiling::scope!("Load vk library");
+-            // ohos support is already fixed on ash main, but it's unclear when
+-            // a new release can happen.
+-            #[cfg(target_env = "ohos")]
+-            let loaded = ash::Entry::load_from("libvulkan.so");
+-            #[cfg(not(target_env = "ohos"))]
+-            let loaded = ash::Entry::load();
+-            loaded
+-        }
+-        .map_err(|err| {
+-            crate::InstanceError::with_source(String::from("missing Vulkan entry points"), err)
+-        })?;
++            #[cfg(ps5)]
++            #[allow(unused_qualifications)]
++            let entry = {
++                extern "system" {
++                    fn vkGetInstanceProcAddr(
++                        instance: vk::Instance,
++                        p_name: *const core::ffi::c_char,
++                    ) -> vk::PFN_vkVoidFunction;
++                }
++                ash::Entry::from_static_fn(ash::StaticFn {
++                    get_instance_proc_addr: vkGetInstanceProcAddr,
++                })
++            };
++            #[cfg(not(ps5))]
++            let entry = {
++                #[cfg(target_env = "ohos")]
++                let loaded = ash::Entry::load_from("libvulkan.so");
++                #[cfg(not(target_env = "ohos"))]
++                let loaded = ash::Entry::load();
++                loaded.map_err(|err| {
++                    crate::InstanceError::with_source(
++                        String::from("missing Vulkan entry points"),
++                        err,
++                    )
++                })?
++            };
++            entry
++        };
+         let version = {
+             profiling::scope!("vkEnumerateInstanceVersion");
+             unsafe { entry.try_enumerate_instance_version() }
+@@ -641,6 +663,13 @@
+             profiling::scope!("vkEnumerateInstanceLayerProperties");
+             unsafe { entry.enumerate_instance_layer_properties() }
+         };
++        // PS5: RADV is linked in with no loader, so there are no layers and
++        // the query answers ERROR_LAYER_NOT_PRESENT.
++        #[cfg(ps5)]
++        let instance_layers = instance_layers.or_else(|e| {
++            log::debug!("enumerate_instance_layer_properties: {e:?} (no layers on PS5)");
++            Ok::<_, vk::Result>(Vec::new())
++        });
+         let instance_layers = instance_layers.map_err(|e| {
+             log::debug!("enumerate_instance_layer_properties: {e:?}");
+             crate::InstanceError::with_source(
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -537,6 +537,7 @@
+ level = "warn"
+ priority = 0
+ check-cfg = [
++    "cfg(ps5)",
+     'cfg(feature, values("cargo-clippy"))',
+     "cfg(web_sys_unstable_apis)",
+ ]

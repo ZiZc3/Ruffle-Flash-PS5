@@ -1,0 +1,331 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 13037c91..5f17c48e 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1890,6 +1890,12 @@ version = "1.0.7"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
+ 
++[[package]]
++name = "foldhash"
++version = "0.1.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
++
+ [[package]]
+ name = "foldhash"
+ version = "0.2.0"
+@@ -1937,6 +1943,16 @@ dependencies = [
+  "ttf-parser",
+ ]
+ 
++[[package]]
++name = "fontdue"
++version = "0.9.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7894823fa221401399e2598f8b63f81ac77ff5c63248b7656779bff1632d7d3d"
++dependencies = [
++ "hashbrown 0.15.5",
++ "ttf-parser",
++]
++
+ [[package]]
+ name = "foreign-types"
+ version = "0.3.2"
+@@ -2281,7 +2297,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "ed4a1bb24121291d27230c1b1b44e07d6a9b28cefdb32fe1581dfb84e14f940a"
+ dependencies = [
+  "bytemuck",
+- "foldhash",
++ "foldhash 0.2.0",
+  "hashbrown 0.17.1",
+  "log",
+  "peniko",
+@@ -2455,6 +2471,17 @@ dependencies = [
+  "smallvec",
+ ]
+ 
++[[package]]
++name = "hashbrown"
++version = "0.15.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
++dependencies = [
++ "allocator-api2",
++ "equivalent",
++ "foldhash 0.1.5",
++]
++
+ [[package]]
+ name = "hashbrown"
+ version = "0.16.1"
+@@ -2463,7 +2490,7 @@ checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
+ dependencies = [
+  "allocator-api2",
+  "equivalent",
+- "foldhash",
++ "foldhash 0.2.0",
+ ]
+ 
+ [[package]]
+@@ -2474,7 +2501,7 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+ dependencies = [
+  "allocator-api2",
+  "equivalent",
+- "foldhash",
++ "foldhash 0.2.0",
+ ]
+ 
+ [[package]]
+@@ -2703,6 +2730,8 @@ dependencies = [
+  "num-traits",
+  "png",
+  "tiff",
++ "zune-core",
++ "zune-jpeg",
+ ]
+ 
+ [[package]]
+@@ -5057,6 +5086,23 @@ dependencies = [
+  "syn 3.0.6",
+ ]
+ 
++[[package]]
++name = "ruffle_ps5"
++version = "1.0.0"
++dependencies = [
++ "ash",
++ "fontdue",
++ "image",
++ "log",
++ "ruffle_core",
++ "ruffle_render",
++ "ruffle_render_wgpu",
++ "ruffle_video_software",
++ "tracing",
++ "url",
++ "wgpu",
++]
++
+ [[package]]
+ name = "ruffle_render"
+ version = "0.6.0"
+@@ -7163,8 +7209,6 @@ dependencies = [
+ [[package]]
+ name = "wgpu-hal"
+ version = "30.0.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "b6b7fb58561a792bc237628ba0792e332de418fefe145f13b5ed8201e6d52f58"
+ dependencies = [
+  "android_system_properties",
+  "arrayvec",
+diff --git a/Cargo.toml b/Cargo.toml
+index 86fd9a1f..7687983c 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -38,8 +38,10 @@ members = [
+     "tools/asc",
+     "tools/fuzzer",
+     "tools/stub-report",
++    "ps5",
+ ]
+ default-members = ["desktop"]
++
+ resolver = "2"
+ 
+ [workspace.package]
+@@ -206,3 +208,6 @@ lto = "off"
+ incremental = true
+ # Right between the defaults of 16 and 256, for crate fragment caching.
+ codegen-units = 64
++
++[patch.crates-io]
++wgpu-hal = { path = "patches/wgpu-hal" }
+diff --git a/core/src/backend/navigator.rs b/core/src/backend/navigator.rs
+index 9d02cc0a..28b7029e 100644
+--- a/core/src/backend/navigator.rs
++++ b/core/src/backend/navigator.rs
+@@ -440,6 +440,55 @@ impl NullNavigatorBackend {
+         }
+     }
+ 
++    /// The packaged file answering a local request with a query or posted
++    /// form ("name.php+id=1"), as a file:// URL, if such a file exists.
++    #[cfg(ps5)]
++    fn packaged_answer(&self, request: &Request) -> Option<String> {
++        let url = self.resolve_url(request.url()).ok()?;
++        if url.scheme() != "file" {
++            return None;
++        }
++        let mut plain = url.clone();
++        plain.set_query(None);
++        let path = url_to_file_path(&plain).ok()?;
++        let mut extras: Vec<String> = Vec::new();
++        if let Some(q) = url.query().filter(|q| !q.is_empty()) {
++            extras.push(q.to_string());
++        }
++        if let Some((data, _)) = request.body() {
++            if let Ok(form) = std::str::from_utf8(data) {
++                if !form.is_empty() {
++                    extras.push(form.to_string());
++                    // With several fields, each one alone (packages often
++                    // keep only the one that matters, like id=1).
++                    if form.contains('&') {
++                        extras.extend(form.split('&').map(String::from));
++                    }
++                }
++            }
++        }
++        if let Some(q) = url.query().filter(|q| q.contains('&')) {
++            extras.extend(q.split('&').map(String::from));
++        }
++        for extra in extras {
++            let candidate = PathBuf::from(format!("{}+{}", path.display(), extra));
++            if candidate.is_file() {
++                tracing::info!("packaged answer: {}", candidate.display());
++                return Url::from_file_path(&candidate).ok().map(|u| u.to_string());
++            }
++        }
++        None
++    }
++
++    /// Spawns onto `executor`, which the frontend keeps and runs every frame
++    /// (`new()` drops its own, so loads such as Loader.loadBytes never finish).
++    pub fn with_executor(executor: &NullExecutor) -> Self {
++        Self {
++            spawner: executor.spawner(),
++            relative_base_path: PathBuf::new(),
++        }
++    }
++
+     pub fn with_base_path(path: &Path, executor: &NullExecutor) -> Result<Self, std::io::Error> {
+         Ok(Self {
+             spawner: executor.spawner(),
+@@ -464,6 +513,32 @@ impl NavigatorBackend for NullNavigatorBackend {
+     }
+ 
+     fn fetch(&self, request: Request) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
++        // PS5 (no network): internet requests stay pending, as when nothing
++        // ran them. Failing them sent preloaders (Newgrounds ads) into their
++        // "connection error" path, which loops forever; pending, they carry on.
++        // Movies from the internet (ads, prerolls, trackers such as Nitrome's
++        // Adunit.swf or CPMStar) fail at once instead: their loaders treat it
++        // like an ad blocker and let the game start, while waiting forever
++        // left those games on their first frame.
++        #[cfg(ps5)]
++        tracing::info!("load {}", request.url());
++        #[cfg(ps5)]
++        if request.url().starts_with("http://") || request.url().starts_with("https://") {
++            let path = request.url().split(['?', '#']).next().unwrap_or("").to_ascii_lowercase();
++            if path.ends_with(".swf") {
++                tracing::warn!("no network on PS5, failing movie load: {}", request.url());
++                return fetch_path(self, "NullNavigatorBackend", "file:///nonexistent/ps5-offline.swf", None);
++            }
++            tracing::warn!("no network on PS5, leaving pending: {}", request.url());
++            return Box::pin(std::future::pending());
++        }
++        // Offline game packages keep server answers as files named after the
++        // request with its query (or posted form) glued on with '+', e.g.
++        // db/get_leveldata_e.php+id=1. Use one when it's there.
++        #[cfg(ps5)]
++        if let Some(packaged) = self.packaged_answer(&request) {
++            return fetch_path(self, "NullNavigatorBackend", &packaged, None);
++        }
+         fetch_path(self, "NullNavigatorBackend", request.url(), None)
+     }
+ 
+diff --git a/render/wgpu/src/backend.rs b/render/wgpu/src/backend.rs
+index 5dcf43c0..222b4604 100644
+--- a/render/wgpu/src/backend.rs
++++ b/render/wgpu/src/backend.rs
+@@ -199,6 +199,63 @@ impl WgpuRenderBackend<crate::target::TextureTarget> {
+         Self::new(Arc::new(descriptors), target)
+     }
+ 
++    /// The GPU device alone, to share between renderers (PS5: one device for
++    /// the app's life instead of a new one per game).
++    pub fn offscreen_descriptors(
++        backend: wgpu::Backends,
++        power_preference: wgpu::PowerPreference,
++    ) -> Result<Arc<Descriptors>, Error> {
++        let instance = create_wgpu_instance(backend, wgpu::BackendOptions::default(), None);
++        let (adapter, device, queue) = futures::executor::block_on(request_adapter_and_device(
++            backend,
++            &instance,
++            None,
++            power_preference,
++        ))?;
++        Ok(Arc::new(Descriptors::new(instance, adapter, device, queue)))
++    }
++
++    /// An offscreen renderer on an existing device.
++    pub fn for_offscreen_with(descriptors: Arc<Descriptors>, size: (u32, u32)) -> Result<Self, Error> {
++        let target = crate::target::TextureTarget::new(&descriptors.device, size)?;
++        Self::new(descriptors, target)
++    }
++
++    /// Reads the frame straight into `out` (RGBA, tightly packed), in
++    /// parallel and without un-premultiplying: a stage is opaque. Returns
++    /// false when there's no readback buffer or `out` is the wrong size.
++    pub fn capture_frame_into(&self, out: &mut [u8]) -> bool {
++        use crate::utils::capture_image;
++        let Some(info) = &self.target.buffer else {
++            return false;
++        };
++        let (buffer, dimensions) = info.buffer.inner();
++        let row = dimensions.unpadded_bytes_per_row;
++        let padded = dimensions.padded_bytes_per_row as usize;
++        if out.len() != row * dimensions.height {
++            return false;
++        }
++        capture_image(&self.descriptors.device, buffer, dimensions, None, |src, _| {
++            const PARTS: usize = 8;
++            let rows_per = dimensions.height.div_ceil(PARTS);
++            std::thread::scope(|s| {
++                for (i, dst) in out.chunks_mut(rows_per * row).enumerate() {
++                    let src = &src[i * rows_per * padded..];
++                    s.spawn(move || {
++                        if padded == row {
++                            dst.copy_from_slice(&src[..dst.len()]);
++                        } else {
++                            for (d, s) in dst.chunks_mut(row).zip(src.chunks(padded)) {
++                                d.copy_from_slice(&s[..row]);
++                            }
++                        }
++                    });
++                }
++            });
++        });
++        true
++    }
++
+     pub fn capture_frame(&self) -> Option<image::RgbaImage> {
+         use crate::utils::buffer_to_image;
+         if let Some(buffer) = &self.target.buffer {
+@@ -1192,7 +1249,25 @@ pub async fn request_adapter_and_device(
+         compatible_surface: surface,
+         force_fallback_adapter: false,
+         apply_limit_buckets: false,
+-    }).await
++    }).await;
++    #[cfg(ps5)]
++    let adapter = match adapter {
++        Ok(a) => Ok(a),
++        Err(e) => {
++            let seen: Vec<String> = instance
++                .enumerate_adapters(backend)
++                .await
++                .iter()
++                .map(|a| format!("{:?}", a.get_info()))
++                .collect();
++            Err(format!(
++                "request_adapter: {e} (adapters seen: {})",
++                if seen.is_empty() { "none".to_string() } else { seen.join(", ") }
++            ))
++        }
++    }?;
++    #[cfg(not(ps5))]
++    let adapter = adapter
+         .map_err(|_e| {
+             let names = get_backend_names(backend);
+             if names.is_empty() {

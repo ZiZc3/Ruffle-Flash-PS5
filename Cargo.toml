@@ -1,0 +1,22 @@
+[package]
+name = "ruffle_ps5"
+version = "1.0.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+# As Ruffle on PC: MP3/AAC/Nellymoser sound, per-game compatibility fixes,
+# and LZMA-compressed (ZWS) SWFs.
+ruffle_core = { path = "../core", default-features = false, features = ["audio", "mp3", "aac", "nellymoser", "default_compatibility_rules", "lzma"] }
+ruffle_render = { path = "../render" }
+ruffle_render_wgpu = { path = "../render/wgpu" }
+ruffle_video_software = { path = "../video/software" }
+wgpu = { workspace = true }
+tracing = { workspace = true, features = ["log"] }
+url = { workspace = true }
+ash = "0.38"
+log = "0.4"
+fontdue = "0.9"
+image = { workspace = true, features = ["png", "jpeg"] }

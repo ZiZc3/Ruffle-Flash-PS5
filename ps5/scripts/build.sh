@@ -33,6 +33,7 @@ mkdir -p "$app/tools"
 cp -r "$repo/src" "$repo/assets" "$repo/Cargo.toml" "$app/"
 cp "$repo/x86_64-ps5-freebsd.json" "$ruffle/"
 cp "$repo"/ps5/scripts/{ps5-link.sh,ps5_early.c,ps5_rust_shims.c} "$app/tools/"
+cp -r "$repo/ps5/scripts/stubs" "$app/tools/"
 sed -i 's/\r$//' "$app/tools/ps5-link.sh" "$repo/ps5/scripts/package.sh"
 chmod +x "$app/tools/ps5-link.sh"
 

@@ -7,6 +7,26 @@ pub const WHITE: Rgb = [0xFF, 0xFF, 0xFF];
 pub const ORANGE: Rgb = [0xF2, 0x6B, 0x1D];
 pub const ORANGE_LIGHT: Rgb = [0xFF, 0xA0, 0x5A];
 pub const INK: Rgb = [0x0B, 0x0B, 0x10];
+pub const GOLD: Rgb = [0xFF, 0xC8, 0x5A];
+
+/// The accent colour (Settings > App > Accent colour), packed 0xRRGGBB.
+static ACCENT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0xF26B1D);
+
+pub fn set_accent(c: Rgb) {
+    ACCENT.store(((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The accent colour: tabs, selection bars, values, spinners.
+pub fn accent() -> Rgb {
+    let v = ACCENT.load(std::sync::atomic::Ordering::Relaxed);
+    [(v >> 16) as u8, (v >> 8) as u8, v as u8]
+}
+
+/// The accent, lighter (glows).
+pub fn accent_light() -> Rgb {
+    let a = accent();
+    [a[0] / 2 + 128, a[1] / 2 + 128, a[2] / 2 + 128]
+}
 
 /// An RGBA8 image.
 #[derive(Clone)]
@@ -126,7 +146,7 @@ impl Canvas {
     }
 
     /// Blends one colour over a row span, clipped.
-    fn blend_span(&mut self, y: i32, x0: i32, x1: i32, c: Rgb, a: u32) {
+    pub fn blend_span(&mut self, y: i32, x0: i32, x1: i32, c: Rgb, a: u32) {
         let (x0, x1) = (x0.max(0), x1.min(self.w));
         if y < 0 || y >= self.h || x1 <= x0 || a == 0 {
             return;
@@ -357,24 +377,107 @@ pub fn fade(px: &mut [u8], brightness: f32) {
     }
 }
 
-/// The app's backdrop: a warm base with waves flowing over it, on a clock
-/// shared by every screen so the waves never jump.
+/// Themes (Settings > App > Theme): name, gradient top and bottom, glow,
+/// and the waves' colour.
+pub const THEMES: [(&str, Rgb, Rgb, Rgb, [u32; 3]); 4] = [
+    ("Ember", [0x2A, 0x12, 0x08], [0x08, 0x06, 0x0A], [0xC0, 0x50, 0x20], [0xFF, 0xD2, 0xA8]),
+    ("Midnight", [0x0A, 0x14, 0x30], [0x03, 0x04, 0x0C], [0x30, 0x58, 0xC0], [0xB8, 0xD0, 0xFF]),
+    ("Retro CRT", [0x05, 0x1A, 0x0E], [0x01, 0x05, 0x03], [0x20, 0x90, 0x48], [0x9C, 0xFF, 0xB8]),
+    ("Newgrounds Dark", [0x20, 0x20, 0x24], [0x09, 0x09, 0x0B], [0x60, 0x58, 0x50], [0xFF, 0xE0, 0xC0]),
+];
+pub const THEME_CRT: u8 = 2;
+
+/// A theme's full-screen base: its gradient with a soft glow up top (and a
+/// vignette for the CRT).
+pub fn theme_base(theme: u8) -> Image {
+    let (_, top, bottom, glow, _) = THEMES[theme as usize % THEMES.len()];
+    let mut small = Image::new(240, 135);
+    for y in 0..135 {
+        for x in 0..240 {
+            let t = y as f32 / 134.0;
+            let d = (((x as f32 - 150.0) / 150.0).powi(2) + ((y as f32 - 25.0) / 95.0).powi(2)).sqrt().min(1.0);
+            let g = (1.0 - d).powi(2) * 0.45;
+            let mut c = [0u8; 3];
+            for i in 0..3 {
+                let base = top[i] as f32 * (1.0 - t) + bottom[i] as f32 * t;
+                let mut v = base + (glow[i] as f32 - base) * g;
+                if theme == THEME_CRT {
+                    let (vx, vy) = (x as f32 / 120.0 - 1.0, y as f32 / 67.5 - 1.0);
+                    v *= 1.0 - 0.45 * (vx * vx * 0.6 + vy * vy).min(1.0);
+                }
+                c[i] = v.clamp(0.0, 255.0) as u8;
+            }
+            let p = ((y * 240 + x) * 4) as usize;
+            small.px[p..p + 4].copy_from_slice(&[c[0], c[1], c[2], 0xFF]);
+        }
+    }
+    small.blur(2);
+    small.resized(1920, 1080)
+}
+
+/// The app's backdrop: the theme's base with waves flowing over it, on a
+/// clock shared by every screen so the waves never jump.
 pub struct Background {
     base: Image,
     start: std::time::Instant,
+    tint: [u32; 3],
+    pub theme: u8,
 }
 
 impl Background {
-    pub fn new(base: Image) -> Self {
-        Background { base, start: std::time::Instant::now() }
+    pub fn new(base: Image, theme: u8) -> Self {
+        let tint = THEMES[theme as usize % THEMES.len()].4;
+        Background { base, start: std::time::Instant::now(), tint, theme }
+    }
+
+    /// Another theme, keeping the waves' clock.
+    pub fn set_theme(&mut self, base: Image, theme: u8) {
+        self.base = base;
+        self.tint = THEMES[theme as usize % THEMES.len()].4;
+        self.theme = theme;
     }
 
     pub fn draw(&self, cv: &mut Canvas, waves: bool) {
         cv.copy_from(&self.base);
         if waves {
-            draw_waves(cv, self.start.elapsed().as_secs_f32());
+            draw_waves(cv, self.start.elapsed().as_secs_f32(), self.tint);
         }
     }
+
+    /// Drawn over a finished menu frame: the CRT theme's scanlines.
+    pub fn overlay(&self, cv: &mut Canvas) {
+        if self.theme == THEME_CRT {
+            let roll = (self.start.elapsed().as_secs_f32() * 40.0) as i32;
+            for y in (0..cv.h).step_by(3) {
+                cv.blend_span(y, 0, cv.w, INK, 72);
+            }
+            // A faint bright band rolling down, like an old set.
+            let band = roll % (cv.h + 200) - 100;
+            for y in band.max(0)..(band + 100).min(cv.h) {
+                let a = (1.0 - ((y - band) as f32 / 50.0 - 1.0).abs()) * 7.0;
+                cv.blend_span(y, 0, cv.w, WHITE, a as u32);
+            }
+        }
+    }
+}
+
+/// A badge medal at (cx, cy) of radius r: gold (or grey when locked) with a
+/// star, an accent ring and a soft glow.
+pub fn medal(cv: &mut Canvas, cx: f32, cy: f32, r: f32, unlocked: bool, alpha: f32, icon: usize) {
+    let (rim, face, star): (Rgb, Rgb, Rgb) = if unlocked {
+        ([0xC8, 0x8A, 0x1E], GOLD, [0xFF, 0xF4, 0xD0])
+    } else {
+        ([0x40, 0x40, 0x46], [0x5A, 0x5A, 0x62], [0x80, 0x80, 0x88])
+    };
+    if unlocked {
+        for i in 0..6 {
+            cv.fill_circle(cx, cy, r * (1.5 - i as f32 * 0.08), GOLD, 0.03 * alpha);
+        }
+    }
+    cv.fill_circle(cx, cy, r, rim, alpha);
+    cv.fill_circle(cx, cy, r * 0.84, face, alpha);
+    cv.stroke_circle(cx, cy, r * 0.84, (r * 0.07).max(1.5), if unlocked { accent() } else { rim }, alpha);
+    super::icons::badge_icon(cv, icon, cx, cy, r * 0.95, star, face, alpha);
 }
 
 /// A diagonal glass highlight sweeping across a rounded rectangle;
@@ -410,14 +513,13 @@ pub fn shine(cv: &mut Canvas, x: i32, y: i32, w: i32, h: i32, r: i32, progress: 
 
 /// Light ribbons flowing across the screen (the PSP / PPSSPP wave look):
 /// each a soft band under a bright edge, swaying with time `t` in seconds.
-pub fn draw_waves(cv: &mut Canvas, t: f32) {
+pub fn draw_waves(cv: &mut Canvas, t: f32, tint: [u32; 3]) {
     const RIBBONS: [(f32, f32, f32, f32, f32, f32); 3] = [
         // base y, amplitude, wavelength k, speed, thickness, phase
         (610.0, 46.0, 0.0021, 0.32, 150.0, 0.0),
         (660.0, 60.0, 0.0016, -0.22, 190.0, 2.1),
         (720.0, 38.0, 0.0027, 0.41, 120.0, 4.2),
     ];
-    let tint: [u32; 3] = [0xFF, 0xD2, 0xA8];
     let stride = (cv.w * 4) as usize;
     // Body opacity at its top edge, in 1/65536ths (0.085).
     const BODY_A: u32 = 5570;
@@ -543,4 +645,59 @@ pub fn pad_icon(cv: &mut Canvas, icon: PadIcon, cx: f32, cy: f32, r: f32) {
             cv.stroke_round_rect((cx - q) as i32, (cy - q) as i32, (2.0 * q) as i32, (2.0 * q) as i32, 2, t as i32, INK, 1.0);
         }
     }
+}
+
+/// Is (x, y) inside the polygon (even-odd rule)?
+fn inside(points: &[(f32, f32)], x: f32, y: f32) -> bool {
+    let mut odd = false;
+    let mut j = points.len() - 1;
+    for i in 0..points.len() {
+        let ((xi, yi), (xj, yj)) = (points[i], points[j]);
+        if (yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi {
+            odd = !odd;
+        }
+        j = i;
+    }
+    odd
+}
+
+impl Canvas {
+    /// A small filled polygon, antialiased by 4x4 samples per pixel.
+    pub fn fill_polygon(&mut self, points: &[(f32, f32)], c: Rgb, alpha: f32) {
+        if points.len() < 3 {
+            return;
+        }
+        let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for &(x, y) in points {
+            (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+        }
+        for py in y0.floor() as i32..=y1.ceil() as i32 {
+            for px in x0.floor() as i32..=x1.ceil() as i32 {
+                let mut hits = 0;
+                for sy in 0..4 {
+                    for sx in 0..4 {
+                        let (fx, fy) = (px as f32 + (sx as f32 + 0.5) / 4.0, py as f32 + (sy as f32 + 0.5) / 4.0);
+                        hits += inside(points, fx, fy) as u32;
+                    }
+                }
+                if hits > 0 {
+                    self.blend(px, py, c, (hits as f32 / 16.0 * alpha * 255.0) as u32);
+                }
+            }
+        }
+    }
+}
+
+/// The mouse pointer: a white arrow with a dark edge and a soft shadow, its
+/// tip at (x, y).
+pub fn pointer(cv: &mut Canvas, x: f32, y: f32, alpha: f32) {
+    const ARROW: [(f32, f32); 7] =
+        [(0.0, 0.0), (0.0, 30.0), (7.5, 23.0), (12.5, 34.5), (17.5, 32.5), (12.5, 21.5), (22.0, 21.5)];
+    let at = |dx: f32, dy: f32, grow: f32| -> Vec<(f32, f32)> {
+        // Grown about the arrow's middle for the edge.
+        ARROW.iter().map(|&(px, py)| (x + dx + (px - 8.0) * grow + 8.0, y + dy + (py - 15.0) * grow + 15.0)).collect()
+    };
+    cv.fill_polygon(&at(2.0, 3.0, 1.12), INK, 0.35 * alpha);
+    cv.fill_polygon(&at(0.0, 0.0, 1.12), INK, 0.9 * alpha);
+    cv.fill_polygon(&at(0.0, 0.0, 1.0), WHITE, alpha);
 }

@@ -61,6 +61,10 @@ stub() {
 }
 stub libSceAgc vendor/ps5/sdk/stubs/agc_canary_link_stub.c
 stub libSceAgcDriver vendor/ps5/sdk/stubs/agc_driver_canary_link_stub.c
+# libSceMouse: no stub in the payload SDK, so our own (link time only).
+cc -std=c11 -O2 -fPIC -c "$here/stubs/libSceMouse_stub.c" -o "$work/obj/libSceMouse_stub.o"
+"$sdk_root/bin/prospero-lld" --shared -soname libSceMouse.prx \
+    -o "$work/stubs/libSceMouse.so" "$work/obj/libSceMouse_stub.o"
 
 # shellcheck source=/dev/null
 source "$vk/tools/radv-link.sh"
@@ -97,6 +101,6 @@ radv_link_flags+=(--version-script "$work/rust-shims-local.map")
     -e _start -o "$out" \
     "$work/obj/app_crt.o" "$work/obj/app_cpp_runtime.o" "$work/obj/ps5_rust_shims.o" "$work/obj/ps5_early.o" \
     --start-group "${inputs[@]}" --end-group \
-    "$work/stubs/libSceAgc.so" "$work/stubs/libSceAgcDriver.so" \
+    "$work/stubs/libSceAgc.so" "$work/stubs/libSceAgcDriver.so" "$work/stubs/libSceMouse.so" \
     "${radv_link_inputs[@]}" \
     --as-needed "$sdk_root"/target/lib/*.so

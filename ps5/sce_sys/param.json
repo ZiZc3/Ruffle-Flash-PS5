@@ -6,11 +6,11 @@
   "applicationDrmType": "free",
   "attribute": 0,
   "attribute2": 0,
-  "attribute3": 0,
+  "attribute3": 524352,
   "conceptId": "68091",
   "contentBadgeType": 1,
   "contentId": "UP9000-PPSA68091_00-RUFFLEPS50000001",
-  "contentVersion": "01.000.000",
+  "contentVersion": "01.200.000",
   "downloadDataSize": 256,
   "gameIntent": {
     "permittedIntents": [
@@ -25,7 +25,7 @@
       "titleName": "Ruffle Flash"
     }
   },
-  "masterVersion": "01.00",
+  "masterVersion": "01.20",
   "pubtools": {
     "creationDate": "2026-10-01 00:00:00",
     "loudnessSnd0": "-28.00",

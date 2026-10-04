@@ -27,7 +27,7 @@ cp "$here"/../sce_sys/* "$app/sce_sys/"
 
 "$tool" link --in "$elf" --out "$work/eboot.elf" \
     --stub-dir "$sdk_root/target/lib" --stub "$work/stubs/libSceAgc.so" \
-    --stub "$work/stubs/libSceAgcDriver.so" --module-sdk "$module_sdk" \
+    --stub "$work/stubs/libSceAgcDriver.so" --stub "$work/stubs/libSceMouse.so" --module-sdk "$module_sdk" \
     --companion-sdk "$companion_sdk" --file-name eboot.elf
 
 mkdir -p "$app/sce_sys" "$app/sce_module"

@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 use ruffle_core::events::{MouseButton, MouseWheelDelta, PlayerEvent};
 
 use crate::controls::{Bind, Controls};
+use crate::hid::{self, Hid, HidFrame};
 use crate::keys::Key;
 
 const SCREEN_WIDTH: f64 = 1920.0;
@@ -54,12 +55,17 @@ unsafe extern "C" {
     fn scePadOpen(user_id: i32, pad_type: i32, index: i32, param: *const u8) -> i32;
     fn scePadGetHandle(user_id: i32, pad_type: i32, index: i32) -> i32;
     fn scePadReadState(handle: i32, data: *mut PadData) -> i32;
+}
 
-    // libSceKeyboard, loaded at run time by ps5_early.c.
-    fn ruffle_ps5_keyboard_load() -> i32;
-    fn ruffle_ps5_keyboard_init() -> i32;
-    fn ruffle_ps5_keyboard_open(user_id: i32, kb_type: i32, index: i32, param: *const u8) -> i32;
-    fn ruffle_ps5_keyboard_read_state(handle: i32, data: *mut u8) -> i32;
+/// The USB mouse and typing in menus: motion in screen pixels, a left
+/// click, characters typed and Backspace (for search).
+#[derive(Clone, Default)]
+pub struct MenuMouse {
+    pub dx: f64,
+    pub dy: f64,
+    pub click: bool,
+    pub typed: Vec<char>,
+    pub backspace: bool,
 }
 
 /// One read of the controller: buttons held, and what changed since the last.
@@ -89,10 +95,23 @@ pub struct Ps5Input {
     cursor_x: f64,
     cursor_y: f64,
     prev_buttons: u32,
+    /// The controller's own buttons last read, and whether it was used then.
+    prev_pad_buttons: u32,
+    pad_used: bool,
     last_cursor_update: Instant,
-    keyboard: Option<KeyboardProbe>,
+    hid: Hid,
+    /// What the USB keyboard and mouse did in the last read.
+    pub hid_frame: HidFrame,
+    /// In menus the keyboard drives them like the controller (arrows, Enter,
+    /// Esc...); in games its keys go to the game.
+    pub keys_as_pad: bool,
+    /// Typing into a search: Space and Backspace type instead of pressing
+    /// Cross and Circle.
+    pub text_entry: bool,
     /// Settings' cursor speed (1.0 = normal).
     pub cursor_speed: f64,
+    /// Settings' mouse speed, frame pixels per mouse count.
+    pub mouse_speed: f64,
     /// Right-stick scrolling not yet sent, in wheel lines.
     wheel: f64,
     last_wheel_update: Instant,
@@ -135,16 +154,25 @@ impl Ps5Input {
             cursor_x: SCREEN_WIDTH / 2.0,
             cursor_y: SCREEN_HEIGHT / 2.0,
             prev_buttons: 0,
+            prev_pad_buttons: 0,
+            pad_used: false,
             last_cursor_update: Instant::now(),
-            keyboard: None,
+            hid: Hid::open(-1),
+            hid_frame: HidFrame::default(),
+            keys_as_pad: true,
+            text_entry: false,
             cursor_speed: 1.0,
+            mouse_speed: 1.2,
             wheel: 0.0,
             last_wheel_update: Instant::now(),
             touches_logged: 0,
             stick_held: [false; 4],
         };
         input.open();
-        input.keyboard = KeyboardProbe::open(input.user);
+        if input.user < 0 && unsafe { sceUserServiceGetInitialUser(&mut input.user) } != 0 {
+            input.user = -1;
+        }
+        input.hid = Hid::open(input.user);
         Ok(input)
     }
 
@@ -166,23 +194,30 @@ impl Ps5Input {
         println!("[PS5] pad: user {}, handle {}", self.user, self.handle);
     }
 
-    /// Reads the controller (and logs the keyboard probe).
+    /// Reads the controller, and the USB keyboard and mouse (in menus the
+    /// keyboard presses the controller's buttons too).
     pub fn read(&mut self) -> PadFrame {
         self.open();
-        if let Some(kb) = self.keyboard.as_mut() {
-            kb.poll();
-        }
-        if self.handle < 0 {
-            return PadFrame::default();
-        }
+        self.hid_frame = self.hid.read();
         let mut data: PadData = unsafe { core::mem::zeroed() };
-        if unsafe { scePadReadState(self.handle, &mut data) } != 0 {
-            return PadFrame::default();
+        if self.handle < 0 || unsafe { scePadReadState(self.handle, &mut data) } != 0 {
+            // No controller: sticks centred, nothing held.
+            data = unsafe { core::mem::zeroed() };
+            (data.lx, data.ly, data.rx, data.ry) = (128, 128, 128, 128);
+        }
+        self.pad_used = data.buttons & !self.prev_pad_buttons != 0;
+        self.prev_pad_buttons = data.buttons;
+        let mut buttons = data.buttons;
+        let mut extra_presses = 0;
+        if self.keys_as_pad {
+            let (held, tapped) = self.menu_buttons();
+            buttons |= held;
+            extra_presses = tapped;
         }
         let frame = PadFrame {
-            held: data.buttons,
-            pressed: data.buttons & !self.prev_buttons,
-            released: !data.buttons & self.prev_buttons,
+            held: buttons,
+            pressed: (buttons & !self.prev_buttons) | extra_presses,
+            released: !buttons & self.prev_buttons,
             lx: data.lx,
             ly: data.ly,
             rx: data.rx,
@@ -193,8 +228,157 @@ impl Ps5Input {
             self.touches_logged += 1;
             println!("[PS5] touch {:?}", frame.touch);
         }
-        self.prev_buttons = data.buttons;
+        self.prev_buttons = buttons;
         frame
+    }
+
+    /// The controller buttons the keyboard and mouse stand for in menus:
+    /// (held, pressed just now). Arrows = D-Pad, Enter/Space = Cross,
+    /// Esc/Backspace = Circle, F2 = Triangle, F3 = Square, F4 = Options,
+    /// Tab/Shift+Tab and PageDown/PageUp = R1/L1 (letters type a search);
+    /// the wheel steps up and down and the right button goes back.
+    fn menu_buttons(&self) -> (u32, u32) {
+        const MAP: [(u16, u32); 11] = [
+            (hid::KEY_UP, PAD_UP),
+            (hid::KEY_DOWN, PAD_DOWN),
+            (hid::KEY_LEFT, PAD_LEFT),
+            (hid::KEY_RIGHT, PAD_RIGHT),
+            (hid::KEY_ENTER, PAD_CROSS),
+            (hid::KEY_SPACE, PAD_CROSS),
+            (hid::KEY_ESCAPE, PAD_CIRCLE),
+            (hid::KEY_BACKSPACE, PAD_CIRCLE),
+            (hid::KEY_F2, PAD_TRIANGLE),
+            (hid::KEY_F3, PAD_SQUARE),
+            (hid::KEY_F4, PAD_OPTIONS),
+        ];
+        let f = &self.hid_frame;
+        let mut held_keys = self.hid.held_keys();
+        if self.text_entry {
+            held_keys.retain(|&k| k != hid::KEY_SPACE && k != hid::KEY_BACKSPACE);
+        }
+        let mut held = 0;
+        for (usage, button) in MAP {
+            if held_keys.contains(&usage) {
+                held |= button;
+            }
+        }
+        let mut tapped = 0;
+        for &(usage, down) in &f.keys {
+            if !down || (self.text_entry && (usage == hid::KEY_SPACE || usage == hid::KEY_BACKSPACE)) {
+                continue;
+            }
+            // A held key is already in `held` (the menus repeat it
+            // themselves); this catches taps shorter than one read.
+            if let Some(&(_, button)) = MAP.iter().find(|(u, _)| *u == usage) {
+                if !held_keys.contains(&usage) {
+                    tapped |= button;
+                }
+            }
+            match usage {
+                hid::KEY_TAB => tapped |= if f.shift { PAD_L1 } else { PAD_R1 },
+                hid::KEY_PAGE_UP => tapped |= PAD_L1,
+                hid::KEY_PAGE_DOWN => tapped |= PAD_R1,
+                _ => {}
+            }
+        }
+        if f.wheel > 0 {
+            tapped |= PAD_UP;
+        } else if f.wheel < 0 {
+            tapped |= PAD_DOWN;
+        }
+        if f.pressed & hid::MOUSE_RIGHT != 0 {
+            tapped |= PAD_CIRCLE;
+        }
+        (held, tapped)
+    }
+
+    /// Ruffle events from the USB mouse and keyboard in a game: the mouse
+    /// moves the same cursor as the stick and clicks, its wheel scrolls, and
+    /// keys go straight to the game.
+    pub fn hid_events(&mut self) -> Vec<PlayerEvent> {
+        let mut events = Vec::new();
+        let (dx, dy, wheel, pressed, released) = {
+            let f = &self.hid_frame;
+            (f.dx, f.dy, f.wheel, f.pressed, f.released)
+        };
+        if dx != 0 || dy != 0 {
+            self.cursor_x = (self.cursor_x + dx as f64 * self.mouse_speed).clamp(0.0, SCREEN_WIDTH - 1.0);
+            self.cursor_y = (self.cursor_y + dy as f64 * self.mouse_speed).clamp(0.0, SCREEN_HEIGHT - 1.0);
+            events.push(PlayerEvent::MouseMove { x: self.cursor_x, y: self.cursor_y });
+        }
+        for (bit, button) in [
+            (hid::MOUSE_LEFT, MouseButton::Left),
+            (hid::MOUSE_RIGHT, MouseButton::Right),
+            (hid::MOUSE_MIDDLE, MouseButton::Middle),
+        ] {
+            if pressed & bit != 0 {
+                events.push(PlayerEvent::MouseDown { x: self.cursor_x, y: self.cursor_y, button, index: None });
+            }
+            if released & bit != 0 {
+                events.push(PlayerEvent::MouseUp { x: self.cursor_x, y: self.cursor_y, button });
+            }
+        }
+        if wheel != 0 {
+            events.push(PlayerEvent::MouseWheel { delta: MouseWheelDelta::Lines(wheel as f64) });
+        }
+        hid::key_events(&self.hid_frame, &mut events);
+        events
+    }
+
+    /// Moves the cursor with the mouse only (the game is paused under a menu).
+    pub fn move_pointer(&mut self) {
+        let (dx, dy) = (self.hid_frame.dx, self.hid_frame.dy);
+        self.cursor_x = (self.cursor_x + dx as f64 * self.mouse_speed).clamp(0.0, SCREEN_WIDTH - 1.0);
+        self.cursor_y = (self.cursor_y + dy as f64 * self.mouse_speed).clamp(0.0, SCREEN_HEIGHT - 1.0);
+    }
+
+    /// The mouse for menus, at the settings' mouse speed.
+    pub fn menu_mouse(&self) -> MenuMouse {
+        let f = &self.hid_frame;
+        // Characters typed: letters, digits and a few signs (Space only once
+        // a search has started; the library ignores a leading one).
+        let typed = f
+            .keys
+            .iter()
+            .filter(|(_, down)| *down)
+            .filter_map(|&(u, _)| hid::key_for(u, f.shift, f.caps).and_then(|(_, c)| c))
+            .filter(|c| c.is_alphanumeric() || " -.'&!:".contains(*c))
+            .filter(|c| *c != ' ' || self.text_entry)
+            .collect();
+        MenuMouse {
+            dx: f.dx as f64 * self.mouse_speed,
+            dy: f.dy as f64 * self.mouse_speed,
+            click: f.pressed & hid::MOUSE_LEFT != 0,
+            typed,
+            backspace: self.text_entry && f.key_pressed(hid::KEY_BACKSPACE),
+        }
+    }
+
+    /// Which was used in the last read: Some(true) the keyboard, Some(false)
+    /// the controller, None neither (for the hints' icons or keys).
+    pub fn last_used_keyboard(&self) -> Option<bool> {
+        if self.hid_frame.keys.iter().any(|&(_, down)| down) {
+            Some(true)
+        } else if self.pad_used {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    /// A USB mouse is plugged in: the menus show their pointer.
+    pub fn mouse_connected(&self) -> bool {
+        self.hid.mouse_connected()
+    }
+
+    /// A USB mouse has been moved or clicked since the app started.
+    pub fn mouse_used(&self) -> bool {
+        self.hid.mouse_seen()
+    }
+
+    /// A USB keyboard has been typed on (the on-screen one isn't needed).
+    pub fn keyboard_plugged(&self) -> bool {
+        self.hid.keyboard_seen()
     }
 
     /// Moves the cursor with the left stick, by the time since the last call,
@@ -326,83 +510,19 @@ impl Ps5Input {
             }
         }
         self.stick_held = [false; 4];
+        for button in [MouseButton::Right, MouseButton::Middle] {
+            events.push(PlayerEvent::MouseUp { x: self.cursor_x, y: self.cursor_y, button });
+        }
+        for usage in self.hid.held_keys() {
+            if let Some((key, _)) = hid::key_for(usage, false, false) {
+                events.push(PlayerEvent::KeyUp { key });
+            }
+        }
         events
     }
 
     /// Where the mouse cursor is, in frame (and Ruffle viewport) pixels.
     pub fn cursor(&self) -> (f64, f64) {
         (self.cursor_x, self.cursor_y)
-    }
-}
-
-/// USB keyboard, experimental: libSceKeyboard has no public header, so this
-/// only logs what sceKeyboardReadState returns whenever it changes, to learn
-/// its layout from a console run with a keyboard plugged in.
-struct KeyboardProbe {
-    handle: i32,
-    last: Vec<u8>,
-    last_rc: i32,
-    logged: u32,
-    polls: u32,
-    /// Bytes that change by themselves (timestamps, counters), learned over
-    /// the first second, left out when looking for key presses.
-    noisy: [bool; 96],
-}
-
-impl KeyboardProbe {
-    fn open(user: i32) -> Option<Self> {
-        if unsafe { ruffle_ps5_keyboard_load() } != 0 {
-            println!("[PS5] keyboard: libSceKeyboard couldn't be loaded");
-            return None;
-        }
-        let rc_init = unsafe { ruffle_ps5_keyboard_init() };
-        let handle = unsafe { ruffle_ps5_keyboard_open(user, 0, 0, core::ptr::null()) };
-        println!("[PS5] keyboard: init {:#x}, open(user {}) -> {:#x}", rc_init, user, handle);
-        if handle < 0 {
-            return None;
-        }
-        Some(KeyboardProbe {
-            handle,
-            last: Vec::new(),
-            last_rc: i32::MIN,
-            logged: 0,
-            polls: 0,
-            noisy: [false; 96],
-        })
-    }
-
-    fn poll(&mut self) {
-        if self.logged >= 300 {
-            return;
-        }
-        let mut buf = [0u8; 256];
-        let rc = unsafe { ruffle_ps5_keyboard_read_state(self.handle, buf.as_mut_ptr()) };
-        let data = &buf[..96];
-        self.polls += 1;
-
-        let first = self.last.is_empty();
-        let mut changed = rc != self.last_rc;
-        if !first {
-            for (i, (a, b)) in data.iter().zip(self.last.iter()).enumerate() {
-                if a != b {
-                    if self.polls <= 60 {
-                        self.noisy[i] = true;
-                    } else if !self.noisy[i] {
-                        changed = true;
-                    }
-                }
-            }
-        }
-        if first || changed || self.polls == 61 {
-            let hex: Vec<String> = data
-                .iter()
-                .enumerate()
-                .map(|(i, b)| if self.noisy[i] { "..".to_string() } else { format!("{:02x}", b) })
-                .collect();
-            println!("[PS5] keyboard state rc {:#x}: {}", rc, hex.join(" "));
-            self.logged += 1;
-        }
-        self.last_rc = rc;
-        self.last = data.to_vec();
     }
 }

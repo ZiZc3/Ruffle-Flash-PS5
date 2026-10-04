@@ -1,4 +1,4 @@
-﻿// std's start-up (lang_start) is skipped: it reopens missing fds 0-2 on
+// std's start-up (lang_start) is skipped: it reopens missing fds 0-2 on
 // /dev/null and aborts when the sandbox refuses. ps5_early.c runs first instead.
 #![no_main]
 
@@ -12,16 +12,20 @@ macro_rules! println {
 }
 
 mod audio;
+mod badges;
 mod covers;
 mod cpu;
 mod display;
+mod hid;
 mod input;
 mod controls;
 mod keys;
 mod ps5ui;
+mod quickmenu;
 mod library;
 mod saves;
 mod settings;
+mod sounds;
 mod ui;
 
 use std::any::Any;
@@ -41,7 +45,8 @@ use ruffle_render_wgpu::backend::WgpuRenderBackend;
 use ruffle_render_wgpu::target::TextureTarget;
 use ruffle_video_software::backend::SoftwareVideoBackend;
 
-use ui::gfx::{self, Background, Canvas, ORANGE, WHITE};
+use quickmenu::Action;
+use ui::gfx::{self, Background, Canvas, accent, WHITE};
 use ui::text::{Text, Weight};
 
 const SCREEN_WIDTH: u32 = 1920;
@@ -52,11 +57,20 @@ const FADE_IN: Duration = Duration::from_millis(350);
 const FADE_OUT: Duration = Duration::from_millis(400);
 /// A game without a cover gets one captured this far into its first run.
 const AUTO_COVER_AFTER: Duration = Duration::from_secs(8);
+/// With this folder present, R3 in a game records CAPTURE_FRAMES frames there.
+const CAPTURE_DIR: &str = "/data/ruffle/capture";
+const CAPTURE_FRAMES: usize = 40;
+/// With this folder present, the game thread is profiled into the log.
+const PROFILE_DIR: &str = "/data/ruffle/profile";
 
 unsafe extern "C" {
     fn sceSystemServiceHideSplashScreen() -> i32;
     fn ruffle_ps5_stage(name: *const core::ffi::c_char);
     fn ruffle_ps5_log(text: *const core::ffi::c_char);
+    fn ruffle_ps5_profile_register();
+    fn ruffle_ps5_profile_start();
+    fn ruffle_ps5_profile_stop();
+    fn ruffle_ps5_profile_report(title: *const core::ffi::c_char);
     fn ruffle_ps5_notify(text: *const core::ffi::c_char);
 }
 
@@ -144,49 +158,6 @@ fn stage(name: &'static str) {
 pub extern "C" fn main(_argc: i32, _argv: *const *const u8) -> i32 {
     run();
     0
-}
-
-/// A white arrow with a black edge, tip at (x, y), on an RGBA frame.
-fn draw_cursor(px: &mut [u8], x: i32, y: i32) {
-    const ARROW: [&str; 16] = [
-        "X",
-        "XX",
-        "X.X",
-        "X..X",
-        "X...X",
-        "X....X",
-        "X.....X",
-        "X......X",
-        "X.......X",
-        "X........X",
-        "X.....XXXXX",
-        "X..X..X",
-        "X.X X..X",
-        "XX  X..X",
-        "X    X..X",
-        "     XXX",
-    ];
-    const SCALE: i32 = 2;
-    for (row, line) in ARROW.iter().enumerate() {
-        for (col, c) in line.bytes().enumerate() {
-            let color = match c {
-                b'X' => [0u8, 0, 0, 255],
-                b'.' => [255u8, 255, 255, 255],
-                _ => continue,
-            };
-            for sy in 0..SCALE {
-                for sx in 0..SCALE {
-                    let px_x = x + col as i32 * SCALE + sx;
-                    let px_y = y + row as i32 * SCALE + sy;
-                    if px_x < 0 || px_y < 0 || px_x >= SCREEN_WIDTH as i32 || px_y >= SCREEN_HEIGHT as i32 {
-                        continue;
-                    }
-                    let i = ((px_y as u32 * SCREEN_WIDTH + px_x as u32) * 4) as usize;
-                    px[i..i + 4].copy_from_slice(&color);
-                }
-            }
-        }
-    }
 }
 
 fn load_swf(path: &str) -> Vec<u8> {
@@ -321,10 +292,20 @@ impl App {
         let tw = self.text.width(Weight::Bold, 60, &title);
         self.text.draw(cv, Weight::Bold, 60, (1920 - tw) / 2, 400, &title, WHITE, 1.0);
         let t = since.elapsed().as_secs_f32();
-        gfx::spinner(cv, 960.0, 556.0, 34.0, 7.0, t, ORANGE);
+        gfx::spinner(cv, 960.0, 556.0, 34.0, 7.0, t, accent());
         let lw = self.text.width(Weight::SemiBold, 24, "Loading");
         self.text.draw(cv, Weight::SemiBold, 24, (1920 - lw) / 2, 622, "Loading", WHITE, 0.7);
+        self.bg.overlay(cv);
         cv.fade(ease(t / FADE_IN.as_secs_f32()));
+    }
+}
+
+/// The menus' background for a theme (Ember keeps its original base).
+fn theme_background(theme: u8) -> gfx::Image {
+    if theme == 0 {
+        covers::make_backdrop("~empty", None)
+    } else {
+        gfx::theme_base(theme)
     }
 }
 
@@ -348,16 +329,18 @@ fn run() {
 
     stage("controller init");
     let input = input::Ps5Input::new().expect("controller");
+    sounds::init();
 
+    let mut library = library::Library::new();
+    let theme = library.settings.theme;
     let mut app = App {
         display,
         input,
         text: Text::new(),
         splash_hidden: false,
         gpu: None,
-        bg: Background::new(covers::make_backdrop("~empty", None)),
+        bg: Background::new(theme_background(theme), theme),
     };
-    let mut library = library::Library::new();
 
     loop {
         stage("game library");
@@ -365,10 +348,20 @@ fn run() {
         let name = library.selected_name();
         let key = library.selected_key();
         library.mark_played(&path);
-        let settings = library.settings.clone();
+        let mut settings = library.settings.clone();
         app.input.cursor_speed = settings.cursor_multiplier();
-        game_session(&mut app, &path, &name, &key, &settings);
-        // Only the game just played can have a new cover.
+        // Restart (from the quick menu) plays it again from the start.
+        let mut session = badges::Session::default();
+        while game_session(&mut app, &path, &name, &key, &mut settings, &mut session) == GameEnd::Restart {
+            session.restarts += 1;
+            library.forget_cover(&key);
+        }
+        library.record_session(&key, &session);
+        if settings.volume != library.settings.volume {
+            library.settings.volume = settings.volume;
+            library.settings.save();
+        }
+        app.input.keys_as_pad = true;
         library.forget_cover(&key);
         library.scan_files();
     }
@@ -377,9 +370,56 @@ fn run() {
 /// The game library, fading in; returns the chosen game after fading out.
 fn library_session(app: &mut App, library: &mut library::Library) -> String {
     let start = Instant::now();
+    // L2: the on-screen keyboard, typing a search.
+    let mut osk = keys::OnScreenKeys::new();
+    let mut cv = Canvas::new(SCREEN_WIDTH as i32, SCREEN_HEIGHT as i32);
     loop {
+        app.input.mouse_speed = library.settings.mouse_multiplier();
+        app.input.text_entry = library.searching();
+        if library.settings.theme != app.bg.theme {
+            let theme = library.settings.theme;
+            app.bg.set_theme(theme_background(theme), theme);
+        }
         let frame = app.input.read();
-        if let Some(path) = library.handle_input(&frame) {
+        for notice in app.input.hid_frame.notices.clone() {
+            library.show_toast(notice);
+        }
+        if let Some(keyboard) = app.input.last_used_keyboard() {
+            library.keyboard_hints = keyboard;
+        }
+        library.mouse_connected = app.input.mouse_connected();
+        let mut mouse = app.input.menu_mouse();
+        let mut frame = frame;
+        if library.can_search() || osk.is_open() {
+            let was_open = osk.is_open();
+            let (events, used) = osk.handle(&frame);
+            if osk.is_open() != was_open {
+                sounds::play(if osk.is_open() { sounds::Sfx::Select } else { sounds::Sfx::Back });
+            }
+            use ruffle_core::events::{LogicalKey, NamedKey, PlayerEvent};
+            for e in events {
+                match e {
+                    PlayerEvent::TextInput { codepoint } => mouse.typed.push(codepoint),
+                    PlayerEvent::KeyDown { key } => match key.logical_key {
+                        LogicalKey::Named(NamedKey::Backspace) => mouse.backspace = true,
+                        LogicalKey::Named(NamedKey::Enter) => osk.set_open(false),
+                        LogicalKey::Named(NamedKey::Escape) => {
+                            library.clear_search();
+                            osk.set_open(false);
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+            if used {
+                // The keyboard took the controller this frame.
+                library.touch_input();
+                frame = input::PadFrame { lx: 128, ly: 128, rx: 128, ry: 128, ..Default::default() };
+            }
+        }
+        library.search_open = osk.is_open();
+        if let Some(path) = library.handle_input(&frame, &mouse) {
             println!("[Ruffle] Selected: {}", if path.is_empty() { "(built-in)" } else { &path });
             let base = library.render(&mut app.text, &app.bg).to_vec();
             app.fade_out(&base, None);
@@ -387,7 +427,11 @@ fn library_session(app: &mut App, library: &mut library::Library) -> String {
         }
         // Copy the frame only while it fades in.
         let t = progress(start, FADE_IN);
-        if t < 1.0 {
+        if osk.is_open() {
+            cv.px.copy_from_slice(library.render(&mut app.text, &app.bg));
+            osk.draw(&mut cv, &mut app.text);
+            app.present(&cv.px);
+        } else if t < 1.0 {
             let mut px = library.render(&mut app.text, &app.bg).to_vec();
             gfx::fade(&mut px, ease(t));
             app.present(&px);
@@ -411,12 +455,29 @@ fn draw_game_toast(cv: &mut Canvas, text: &mut Text, msg: &str, since: Instant) 
     let w = text.width(Weight::SemiBold, 24, msg) + 56;
     let x = 1920 - 96 - w;
     cv.fill_round_rect(x, 56, w, 56, 28, gfx::INK, 0.8 * a);
-    cv.fill_circle((x + 26) as f32, 84.0, 6.0, ORANGE, a);
+    cv.fill_circle((x + 26) as f32, 84.0, 6.0, accent(), a);
     text.draw(cv, Weight::SemiBold, 24, x + 42, 70, msg, WHITE, a);
 }
 
-/// Plays one game until the touchpad is pressed, then fades back out.
-fn game_session(app: &mut App, path: &str, name: &str, key: &str, settings: &settings::Settings) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GameEnd {
+    Library,
+    Restart,
+}
+
+/// Plays one game until it's left from the quick menu (the touchpad opens
+/// it), then fades back out.
+fn game_session(
+    app: &mut App,
+    path: &str,
+    name: &str,
+    key: &str,
+    settings: &mut settings::Settings,
+    session: &mut badges::Session,
+) -> GameEnd {
+    app.input.keys_as_pad = false;
+    app.input.text_entry = false;
+    app.input.mouse_speed = settings.mouse_multiplier();
     // The file is read and parsed (and, the first time, the GPU device made)
     // on a worker while the loading screen's spinner turns.
     stage("load swf");
@@ -459,12 +520,12 @@ fn game_session(app: &mut App, path: &str, name: &str, key: &str, settings: &set
             println!("*** {}: {}", path, e);
             notify(&format!("Ruffle: {}: {}", name, e));
             app.fade_out(&cv.px, None);
-            return;
+            return GameEnd::Library;
         }
         Err(_) => {
             notify(&format!("Ruffle: loading {} crashed", name));
             app.fade_out(&cv.px, None);
-            return;
+            return GameEnd::Library;
         }
     };
     if gpu.is_some() {
@@ -501,7 +562,7 @@ fn game_session(app: &mut App, path: &str, name: &str, key: &str, settings: &set
         Err(e) => {
             println!("*** wgpu renderer failed: {:?}", e);
             notify(&format!("Ruffle: renderer failed: {}", e));
-            return;
+            return GameEnd::Library;
         }
     };
 
@@ -607,6 +668,16 @@ fn game_session(app: &mut App, path: &str, name: &str, key: &str, settings: &set
     };
     println!("[Ruffle] Player started");
     stage("game loop");
+    // Where the game thread's time goes, in the log every minute and at the
+    // end; only with a /data/ruffle/profile folder (a developer's tool).
+    let profiling = std::path::Path::new(PROFILE_DIR).is_dir();
+    if profiling {
+        unsafe {
+            ruffle_ps5_profile_register();
+            ruffle_ps5_profile_start();
+        }
+    }
+    let mut profile_since = Instant::now();
 
     let mut keyboard = keys::OnScreenKeys::new();
     let mut keyboard_request: Option<(bool, Instant)> = None;
@@ -622,6 +693,15 @@ fn game_session(app: &mut App, path: &str, name: &str, key: &str, settings: &set
     let mut fps_frames = 0u32;
     let mut fps_since = Instant::now();
     let mut toast: Option<(&str, Instant)> = None;
+    // Time spent in the quick menu doesn't count as play time.
+    let mut paused_for = Duration::ZERO;
+    let mut menu_opened_at: Option<Instant> = None;
+    let mut menu: Option<quickmenu::QuickMenu> = None;
+    let mut end = GameEnd::Library;
+    // The frame to fade out from when the game ends (the menu's, if left from it).
+    let mut exit_frame: Option<Vec<u8>> = None;
+    // The menu's hints show keyboard keys after the keyboard was used.
+    let mut menu_hints = app.input.keyboard_plugged();
     let (mut ticks, mut drawn, mut capture_failed) = (0u64, 0u64, 0u64);
     let mut last_stats = Instant::now();
     // Where a frame's time goes (ms, summed over the 5 s): the game's code,
@@ -631,24 +711,109 @@ fn game_session(app: &mut App, path: &str, name: &str, key: &str, settings: &set
     let ms = |since: Instant| since.elapsed().as_secs_f64() * 1000.0;
     // wgpu's Debug lines were only wanted while it found the GPU.
     log::set_max_level(log::LevelFilter::Info);
+    let capture_mode = std::path::Path::new(CAPTURE_DIR).is_dir();
+    let (mut capturing, mut capture) = (false, Vec::<(f64, Vec<u8>)>::new());
 
     loop {
         let pad = app.input.read();
-        // While the keyboard is open the touchpad drags it; a press made
-        // while dragging mustn't end the game.
-        if pad.just_pressed(input::PAD_TOUCHPAD) && !keyboard.is_open() {
-            println!("[Ruffle] Touchpad: back to the library");
-            break;
+        for &notice in &app.input.hid_frame.notices {
+            toast = Some((notice, Instant::now()));
+        }
+        if menu.is_none() {
+            let hf = &app.input.hid_frame;
+            session.keyboard |= hf.keys.iter().any(|&(_, down)| down);
+            session.mouse |= hf.mouse_moved() || hf.pressed != 0;
+        }
+
+        // The quick menu, over the paused game.
+        if let Some(m) = menu.as_mut() {
+            app.input.move_pointer();
+            let mouse = app.input.menu_mouse();
+            let action = m.handle(&pad, &mouse, app.input.cursor());
+            if let Action::Volume(v) = action {
+                settings.volume = v;
+                player.lock().expect("player lock").set_volume(v as f32 / 10.0);
+            }
+            match action {
+                Action::None | Action::Volume(_) => {
+                    if let Some(k) = app.input.last_used_keyboard() {
+                        menu_hints = k;
+                    }
+                    let pointer = if app.input.mouse_connected() || app.input.hid_frame.mouse_moved() {
+                        Some(app.input.cursor())
+                    } else {
+                        None
+                    };
+                    m.draw(&mut cv, &mut app.text, menu_hints, pointer);
+                    app.present(&cv.px);
+                    continue;
+                }
+                Action::Resume | Action::Cover => {
+                    if action == Action::Cover && renders > 0 {
+                        let (frame, key) = (last_frame.clone(), key.to_string());
+                        std::thread::spawn(move || covers::save_cover(&key, &frame, cover_w, cover_h));
+                        toast = Some(("Cover saved", Instant::now()));
+                        need_auto_cover = false;
+                        session.covers += 1;
+                    }
+                    if let Some(at) = menu_opened_at.take() {
+                        paused_for += at.elapsed();
+                    }
+                    menu = None;
+                    app.input.keys_as_pad = false;
+                    player.lock().expect("player lock").set_is_playing(true);
+                    last_tick = Instant::now();
+                    println!("[Ruffle] Quick menu: resumed");
+                    continue;
+                }
+                Action::Restart | Action::Library => {
+                    end = if action == Action::Restart { GameEnd::Restart } else { GameEnd::Library };
+                    println!("[Ruffle] Quick menu: {}", if end == GameEnd::Restart { "restart" } else { "back to the library" });
+                    exit_frame = Some(cv.px.clone());
+                    break;
+                }
+            }
+        }
+
+        // The touchpad (or Esc / Pause on a keyboard) opens the quick menu.
+        // While the on-screen keyboard is open the touchpad drags it instead.
+        let menu_key = app.input.hid_frame.key_pressed(hid::KEY_ESCAPE) || app.input.hid_frame.key_pressed(hid::KEY_PAUSE);
+        if (pad.just_pressed(input::PAD_TOUCHPAD) && !keyboard.is_open()) || menu_key {
+            println!("[Ruffle] Quick menu opened");
+            session.quick_menus += 1;
+            menu_opened_at = Some(Instant::now());
+            sounds::play(sounds::Sfx::Select);
+            let mut p = player.lock().expect("player lock");
+            for e in keyboard.release_all().into_iter().chain(app.input.release_all(&controls)) {
+                p.handle_event(e);
+            }
+            p.set_is_playing(false);
+            drop(p);
+            if keyboard.is_open() {
+                keyboard.set_open(false);
+            }
+            app.input.keys_as_pad = true;
+            menu = Some(quickmenu::QuickMenu::new(&last_frame, name, settings.volume));
+            continue;
+        }
+
+        // Frame capture for tuning Flash Frame Generation: with a
+        // /data/ruffle/capture folder, R3 records the next frames instead of
+        // taking a cover.
+        if capture_mode && pad.just_pressed(input::PAD_R3) && capture.is_empty() && !capturing {
+            capturing = true;
+            toast = Some(("Capturing frames...", Instant::now()));
         }
 
         // Covers: one taken automatically on the first run, R3 retakes it.
         let auto = need_auto_cover && renders > 0 && started.elapsed() >= AUTO_COVER_AFTER;
-        if auto || (pad.just_pressed(input::PAD_R3) && renders > 0) {
+        if auto || (!capture_mode && pad.just_pressed(input::PAD_R3) && renders > 0) {
             // Cropped and encoded off the game loop, so the game doesn't hitch.
             let (frame, key) = (last_frame.clone(), key.to_string());
             std::thread::spawn(move || covers::save_cover(&key, &frame, cover_w, cover_h));
             if !auto {
                 toast = Some(("Cover saved", Instant::now()));
+                session.covers += 1;
             }
             need_auto_cover = false;
         }
@@ -663,7 +828,8 @@ fn game_session(app: &mut App, path: &str, name: &str, key: &str, settings: &set
         if let Some((want, at)) = keyboard_request {
             if at.elapsed() >= Duration::from_millis(400) {
                 keyboard_request = None;
-                let allowed = settings.auto_keyboard && !keyboard.user_closed;
+                // Not when a USB keyboard is there to type on.
+                let allowed = settings.auto_keyboard && !keyboard.user_closed && !app.input.keyboard_plugged();
                 if allowed && want && !was_open {
                     println!("[Ruffle] Text box focused: opening the keyboard");
                     keyboard.set_open(true);
@@ -685,6 +851,8 @@ fn game_session(app: &mut App, path: &str, name: &str, key: &str, settings: &set
         if !used && !keyboard.is_open() {
             events.extend(app.input.game_events(&pad, &controls));
         }
+        // A USB mouse and keyboard play the game whatever the controller does.
+        events.extend(app.input.hid_events());
 
         {
             let mut p = player.lock().expect("player lock");
@@ -719,6 +887,24 @@ fn game_session(app: &mut App, path: &str, name: &str, key: &str, settings: &set
                     } else {
                         renders += 1;
                         fps_frames += 1;
+                        if capturing {
+                            capture.push((started.elapsed().as_secs_f64(), last_frame.clone()));
+                            if capture.len() == CAPTURE_FRAMES {
+                                capturing = false;
+                                // Raw RGBA 1920x1080 per frame, plus when each was made.
+                                let frames = std::mem::take(&mut capture);
+                                std::thread::spawn(move || {
+                                    let mut times = String::new();
+                                    for (i, (t, px)) in frames.iter().enumerate() {
+                                        let _ = std::fs::write(format!("{}/frame_{:02}.rgba", CAPTURE_DIR, i), px);
+                                        times.push_str(&format!("{} {:.4}\n", i, t));
+                                    }
+                                    let _ = std::fs::write(format!("{}/times.txt", CAPTURE_DIR), times);
+                                    println!("[Ruffle] Captured {} frames to {}", frames.len(), CAPTURE_DIR);
+                                });
+                                toast = Some(("Frames captured", Instant::now()));
+                            }
+                        }
                         if renders == 1 {
                             println!("[Ruffle] First game frame rendered");
                         }
@@ -760,6 +946,13 @@ fn game_session(app: &mut App, path: &str, name: &str, key: &str, settings: &set
                 per(spent[5]),
             );
             spent = [0.0; 6];
+            if profiling && profile_since.elapsed() >= Duration::from_secs(60) {
+                unsafe {
+                    ruffle_ps5_profile_report(c"last minute".as_ptr());
+                    ruffle_ps5_profile_start();
+                }
+                profile_since = Instant::now();
+            }
             (ticks, drawn, capture_failed) = (0, 0, 0);
             last_stats = Instant::now();
         }
@@ -770,7 +963,7 @@ fn game_session(app: &mut App, path: &str, name: &str, key: &str, settings: &set
         // when the left stick plays as keys and the cursor sits idle.
         if !keyboard.is_open() && !ui_state.mouse_hidden() {
             let (cx, cy) = app.input.cursor();
-            draw_cursor(&mut cv.px, cx as i32, cy as i32);
+            gfx::pointer(&mut cv, cx as f32, cy as f32, 1.0);
         }
         keyboard.draw(&mut cv, &mut app.text);
         if let Some((msg, at)) = toast {
@@ -803,12 +996,21 @@ fn game_session(app: &mut App, path: &str, name: &str, key: &str, settings: &set
             p.handle_event(e);
         }
     }
-    app.fade_out(&last_frame, volume.as_deref());
+    app.fade_out(exit_frame.as_deref().unwrap_or(&last_frame), volume.as_deref());
     {
         let mut p = player.lock().expect("player lock");
         p.flush_shared_objects();
         p.set_is_playing(false);
     }
     drop(player);
+    if profiling {
+        unsafe {
+            ruffle_ps5_profile_report(c"until the game closed".as_ptr());
+            ruffle_ps5_profile_stop();
+        }
+    }
+    let in_menu = menu_opened_at.map_or(Duration::ZERO, |at| at.elapsed());
+    session.secs += started.elapsed().saturating_sub(paused_for + in_menu).as_secs();
     println!("[Ruffle] Game closed");
+    end
 }

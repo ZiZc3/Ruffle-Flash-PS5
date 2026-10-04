@@ -9,7 +9,7 @@ use ruffle_core::events::{KeyDescriptor, KeyLocation, LogicalKey, NamedKey, Phys
 use crate::input::{
     PadFrame, PAD_CIRCLE, PAD_CROSS, PAD_DOWN, PAD_L2, PAD_LEFT, PAD_RIGHT, PAD_SQUARE, PAD_TRIANGLE, PAD_UP,
 };
-use crate::ui::gfx::{self, Canvas, PadIcon, ORANGE, WHITE};
+use crate::ui::gfx::{self, Canvas, PadIcon, accent, WHITE};
 use crate::ui::text::{Text, Weight};
 
 #[derive(Clone, Copy)]
@@ -355,8 +355,8 @@ impl OnScreenKeys {
                 let w = units * KEY + (units - 1) * GAP;
                 let selected = r == self.row && c == self.col;
                 if selected {
-                    cv.glow(x, y, w, KEY, 14, 22, ORANGE, 0.6);
-                    cv.fill_round_rect(x, y, w, KEY, 14, ORANGE, 1.0);
+                    cv.glow(x, y, w, KEY, 14, 22, accent(), 0.6);
+                    cv.fill_round_rect(x, y, w, KEY, 14, accent(), 1.0);
                 } else {
                     cv.fill_round_rect(x, y, w, KEY, 14, WHITE, 0.09);
                 }

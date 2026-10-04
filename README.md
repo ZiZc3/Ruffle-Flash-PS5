@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-1.0.0-f37a2b">
+  <img alt="Version" src="https://img.shields.io/badge/version-1.2.0-f37a2b">
   <img alt="Platform" src="https://img.shields.io/badge/platform-PS5-1f1f1f">
   <img alt="Renderer" src="https://img.shields.io/badge/renderer-Vulkan%20(RADV)-c0561b">
   <img alt="Language" src="https://img.shields.io/badge/made%20with-Rust-b7410e">
@@ -28,7 +28,12 @@
 - Plays `.swf` games and animations (ActionScript 1, 2 and 3), rendered on the PS5's GPU.
 - Library with **Recent**, **Games** and **Favorites** tabs, list or grid view, and covers taken automatically from your games.
 - **Controls per game**: map any DualSense button to a key or a mouse click.
-- **On-screen keyboard** L2 to run it, some games needs keyboard.
+- **USB mouse and keyboard**: plug them into the PS5 and play; they work in the menus too.
+- **Quick menu** in game (touchpad): resume, restart, volume, retake cover, back to the library.
+- **Themes** (Ember, Midnight, Retro CRT, Newgrounds Dark) and **accent colours**, with calm, quiet menu sounds.
+- **Badges**: 34 goals to unlock while you play, each with its own medal (can be turned off), plus **play time** for every game.
+- **Search** your games (L2 or just type on a keyboard), and a **screensaver** with your covers drifting by.
+- **On-screen keyboard** L2 to run it in games, some games needs keyboard.
 - Ruffle's own player settings: quality, scale mode, letterbox, frame rate, player version and more.
 - Sound with MP3, AAC and Nellymoser support.
 
@@ -56,6 +61,7 @@ Download the [latest release](https://github.com/ZiZc3/Ruffle-Flash-PS5/releases
 | □ | List / grid view |
 | Options | Controls for this game |
 | L1 / R1 | Switch tabs |
+| L2 | Search |
 
 **In game** (defaults; change them per game with Options in the library)
 
@@ -70,7 +76,11 @@ Download the [latest release](https://github.com/ZiZc3/Ruffle-Flash-PS5/releases
 | Right stick | Scroll |
 | L2 | On-screen keyboard |
 | R3 | Take a new cover |
-| **Touchpad click** | Back to the library |
+| **Touchpad click** | Quick menu (resume, restart, volume, back to the library) |
+
+**USB mouse and keyboard**
+
+Plug them into the PS5 and they just work. In games the mouse points, clicks and scrolls and the keyboard types and plays; **Esc** opens the quick menu. In the menus: type to search, arrows move, **Enter** selects, **Esc** goes back, **Tab** switches tabs, **F2** favorites, **F3** list/grid, **F4** controls; the mouse pointer shows while a mouse is plugged in, and right click goes back.
 
 ## Folders on the PS5
 

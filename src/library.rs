@@ -5,14 +5,16 @@ use std::collections::HashMap;
 use std::fs;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::badges::{Badges, Live, Session, BADGES};
 use crate::covers::{self, TILE_H, TILE_W};
+use crate::sounds::{self, Sfx};
 use crate::controls::{self, Bind, Controls};
 use crate::input::{
-    PadFrame, PAD_CIRCLE, PAD_CROSS, PAD_DOWN, PAD_L1, PAD_LEFT, PAD_OPTIONS, PAD_R1, PAD_RIGHT, PAD_SQUARE,
-    PAD_TRIANGLE, PAD_UP,
+    MenuMouse, PadFrame, PAD_CIRCLE, PAD_CROSS, PAD_DOWN, PAD_L1, PAD_LEFT, PAD_OPTIONS, PAD_R1, PAD_RIGHT,
+    PAD_SQUARE, PAD_TRIANGLE, PAD_UP,
 };
 use crate::settings::{self, Row, Settings};
-use crate::ui::gfx::{self, Background, Canvas, Image, PadIcon, ORANGE, ORANGE_LIGHT, WHITE};
+use crate::ui::gfx::{self, Background, Canvas, Image, PadIcon, accent, accent_light, WHITE};
 use crate::ui::text::{Text, Weight};
 
 const W: i32 = 1920;
@@ -54,6 +56,71 @@ unsafe extern "C" {
     fn ruffle_ps5_clock(hour: *mut i32, minute: *mut i32) -> i32;
 }
 
+/// Something the mouse pointer can point at, as drawn last frame.
+#[derive(Clone, Copy, PartialEq)]
+enum Hit {
+    Tab(usize),
+    /// A game, by its place in the tab's list.
+    Game(usize),
+    /// A settings row (index in settings::ROWS), and its "<" arrow.
+    Setting(usize),
+    SettingLeft(usize),
+    /// A row of the controls page, and its "<" arrow.
+    Editor(usize),
+    EditorLeft(usize),
+    /// A hint or menu row: clicking presses this controller button.
+    Button(u32),
+    Badge(usize),
+}
+
+/// The pointer stays this long after the mouse last moved, then fades.
+const POINTER_IDLE: f32 = 4.0;
+
+/// A button hint's controller button, for clicks on it.
+fn button_of(icon: Option<PadIcon>, chip: &str) -> Option<u32> {
+    match (icon, chip) {
+        (Some(PadIcon::Cross), _) => Some(PAD_CROSS),
+        (Some(PadIcon::Circle), _) => Some(PAD_CIRCLE),
+        (Some(PadIcon::Triangle), _) => Some(PAD_TRIANGLE),
+        (Some(PadIcon::Square), _) => Some(PAD_SQUARE),
+        (None, "Options") => Some(PAD_OPTIONS),
+        (None, "L1 R1") => Some(PAD_R1),
+        _ => None,
+    }
+}
+
+/// The keyboard key standing for a button hint (input.rs menu_buttons).
+pub fn keyboard_key(icon: Option<PadIcon>, chip: &str) -> Option<&'static str> {
+    match (icon, chip) {
+        (Some(PadIcon::Cross), _) => Some("Enter"),
+        (Some(PadIcon::Circle), _) => Some("Esc"),
+        (Some(PadIcon::Triangle), _) => Some("F2"),
+        (Some(PadIcon::Square), _) => Some("F3"),
+        (None, "Options") => Some("F4"),
+        (None, "L1 R1") => Some("Tab"),
+        _ => None,
+    }
+}
+
+/// A hint's lead at (x, centre y): the button's icon, or a key chip (the
+/// keyboard's key when one is in use); returns how far the label starts.
+pub fn draw_hint_lead(cv: &mut Canvas, text: &mut Text, icon: Option<PadIcon>, chip: &str, keyboard: bool, x: i32, cy: i32) -> i32 {
+    let key = if keyboard { keyboard_key(icon, chip) } else { None };
+    match (icon, key) {
+        (Some(ic), None) => {
+            gfx::pad_icon(cv, ic, (x + 18) as f32, cy as f32, 17.0);
+            48
+        }
+        _ => {
+            let chip = key.unwrap_or(chip);
+            let cw = text.width(Weight::SemiBold, 15, chip) + 18;
+            cv.stroke_round_rect(x, cy - 14, cw, 28, 7, 2, WHITE, 0.45);
+            text.draw(cv, Weight::SemiBold, 15, x + 9, cy - 9, chip, WHITE, 0.75);
+            cw + 14
+        }
+    }
+}
+
 struct ControlsEditor {
     key: String,
     name: String,
@@ -74,15 +141,38 @@ enum Tab {
     Recent,
     Games,
     Favorites,
+    Badges,
     Settings,
 }
 
-const TABS: [(Tab, &str); 4] = [
+const TABS: [(Tab, &str); 5] = [
     (Tab::Recent, "Recent"),
     (Tab::Games, "Games"),
     (Tab::Favorites, "Favorites"),
+    (Tab::Badges, "Badges"),
     (Tab::Settings, "Settings"),
 ];
+const GAMES_TAB: usize = 1;
+
+const PLAYTIME_FILE: &str = "/data/ruffle/playtime.txt";
+/// The screensaver starts after this long without input in the menus.
+const SAVER_AFTER: Duration = Duration::from_secs(120);
+
+/// The badges grid.
+const BCOLS: usize = 5;
+const BW: i32 = 236;
+const BH: i32 = 206;
+const BGAP: i32 = 21;
+const BROW: i32 = BH + BGAP;
+
+/// "3 h 20 m", "12 min", "under a minute".
+fn format_play(secs: u64) -> String {
+    match secs {
+        0..=59 => "under a minute".into(),
+        60..=3599 => format!("{} min", secs / 60),
+        _ => format!("{} h {} m", secs / 3600, secs / 60 % 60),
+    }
+}
 const TAB_COUNT: usize = TABS.len();
 
 fn now_secs() -> u64 {
@@ -157,6 +247,29 @@ pub struct Library {
     held_dir: u32,
     next_repeat: Option<Instant>,
     toast: Option<(String, Instant)>,
+    /// The mouse pointer, and when the mouse last moved (None: hidden).
+    pointer: (f32, f32),
+    pointer_moved: Option<Instant>,
+    /// What can be pointed at, from the last frame drawn.
+    hits: Vec<(i32, i32, i32, i32, Hit)>,
+    /// Hints show keyboard keys (a USB keyboard was used last).
+    pub keyboard_hints: bool,
+    /// A USB mouse is plugged in: the pointer stays on screen.
+    pub mouse_connected: bool,
+    pointer_shown: f32,
+    pub badges: Badges,
+    /// Seconds played per game key.
+    playtime: HashMap<String, u64>,
+    /// Typed search (filters the Games tab).
+    search: String,
+    /// The on-screen keyboard is typing a search (main.rs draws it).
+    pub search_open: bool,
+    tabs_end: i32,
+    last_input: Instant,
+    /// The screensaver, since when.
+    saver: Option<Instant>,
+    badge_sel: usize,
+    badge_scroll: f32,
     canvas: Canvas,
     start: Instant,
     last_render: Instant,
@@ -203,11 +316,40 @@ impl Library {
             held_dir: 0,
             next_repeat: None,
             toast: None,
+            pointer: (W as f32 / 2.0, H as f32 / 2.0),
+            pointer_moved: None,
+            hits: Vec::new(),
+            keyboard_hints: false,
+            mouse_connected: false,
+            pointer_shown: 0.0,
+            badges: Badges::load(),
+            playtime: fs::read_to_string(PLAYTIME_FILE)
+                .map(|s| {
+                    s.lines()
+                        .filter_map(|l| {
+                            let (t, k) = l.split_once('\t')?;
+                            Some((k.to_string(), t.parse().ok()?))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            search: String::new(),
+            search_open: false,
+            tabs_end: GRID_X,
+            last_input: Instant::now(),
+            saver: None,
+            badge_sel: 0,
+            badge_scroll: 0.0,
             canvas: Canvas::new(W, H),
             start: Instant::now(),
             last_render: Instant::now(),
         };
         lib.scan_files();
+        gfx::set_accent(settings::ACCENTS[lib.settings.accent as usize].1);
+        sounds::set_enabled(lib.settings.ui_sounds);
+        lib.badges.stats.themes_mask |= 1 << lib.settings.theme;
+        lib.badges.stats.accents_mask |= 1 << lib.settings.accent;
+        lib.check_badges();
         lib.view_t = if lib.settings.list_view { 1.0 } else { 0.0 };
         // Open on Recent when something was played before.
         if !lib.visible_for(0).is_empty() {
@@ -260,8 +402,11 @@ impl Library {
 
     fn visible_for(&self, tab: usize) -> Vec<usize> {
         match TABS[tab].0 {
-            Tab::Settings => Vec::new(),
-            Tab::Games => (0..self.games.len()).collect(),
+            Tab::Settings | Tab::Badges => Vec::new(),
+            Tab::Games => {
+                let q = self.search.to_lowercase();
+                (0..self.games.len()).filter(|&i| q.is_empty() || self.games[i].name.to_lowercase().contains(&q)).collect()
+            }
             Tab::Recent => self
                 .recent
                 .iter()
@@ -286,10 +431,83 @@ impl Library {
         self.current().map(|g| g.key.clone()).unwrap_or_else(|| covers::game_key(""))
     }
 
+    fn tab_enabled(&self, i: usize) -> bool {
+        TABS[i].0 != Tab::Badges || self.settings.badges
+    }
+
+    /// Counts badges' "right now" numbers.
+    fn live(&self) -> Live {
+        Live {
+            games_played: self.playtime.values().filter(|s| **s > 0).count() as u64,
+            library_size: self.games.len() as u64,
+            favorites: self.favorites.len() as u64,
+        }
+    }
+
+    fn check_badges(&mut self) {
+        let live = self.live();
+        self.badges.check(&live);
+    }
+
+    /// The typed search, while there is one.
+    pub fn searching(&self) -> bool {
+        !self.search.is_empty()
+    }
+
+    /// The on-screen keyboard may open for a search here (a games tab, no
+    /// page over it).
+    pub fn can_search(&self) -> bool {
+        self.editor.is_none()
+            && self.about_page.is_none()
+            && self.saver.is_none()
+            && matches!(TABS[self.tab].0, Tab::Recent | Tab::Games | Tab::Favorites)
+    }
+
+    pub fn clear_search(&mut self) {
+        self.search.clear();
+    }
+
+    /// Input that went elsewhere (the on-screen keyboard) still counts as
+    /// someone being there.
+    pub fn touch_input(&mut self) {
+        self.last_input = Instant::now();
+    }
+
+    /// After a game: its play time and what happened, for badges.
+    pub fn record_session(&mut self, key: &str, s: &Session) {
+        *self.playtime.entry(key.to_string()).or_insert(0) += s.secs;
+        let body: String = self.playtime.iter().map(|(k, t)| format!("{}\t{}\n", t, k)).collect();
+        if let Err(e) = fs::write(PLAYTIME_FILE, body) {
+            println!("[Library] can't write {}: {}", PLAYTIME_FILE, e);
+        }
+        let st = &mut self.badges.stats;
+        st.play_secs += s.secs;
+        st.longest_secs = st.longest_secs.max(s.secs);
+        st.covers += s.covers as u64;
+        st.quick_menus += s.quick_menus as u64;
+        st.restarts += s.restarts as u64;
+        st.keyboard += s.keyboard as u64;
+        st.mouse += s.mouse as u64;
+        self.badges.save();
+        self.check_badges();
+        self.last_input = Instant::now();
+    }
+
     pub fn mark_played(&mut self, path: &str) {
         if path.is_empty() {
             return;
         }
+        self.badges.stats.launches += 1;
+        let (mut h, mut m) = (12, 0);
+        if unsafe { ruffle_ps5_clock(&mut h, &mut m) } == 0 {
+            if h < 5 {
+                self.badges.stats.night += 1;
+            } else if h < 8 {
+                self.badges.stats.morning += 1;
+            }
+        }
+        self.badges.save();
+        self.check_badges();
         self.recent.retain(|(p, _)| p != path);
         self.recent.insert(0, (path.to_string(), now_secs()));
         self.recent.truncate(30);
@@ -316,9 +534,225 @@ impl Library {
         self.selected[self.tab] = self.selected[self.tab].min(n.saturating_sub(1));
     }
 
-    /// Returns the game to start ("" for the built-in demo).
-    pub fn handle_input(&mut self, f: &PadFrame) -> Option<String> {
+    pub fn show_toast(&mut self, msg: &str) {
+        self.toast = Some((msg.to_string(), Instant::now()));
+    }
+
+    /// The pointer is there while a mouse is plugged in (or just used), and
+    /// fades away when it's unplugged.
+    fn pointer_alpha(&mut self) -> f32 {
+        let recent = self.pointer_moved.is_some_and(|t| t.elapsed().as_secs_f32() < POINTER_IDLE);
+        let target = if self.mouse_connected || recent { 1.0 } else { 0.0 };
+        self.pointer_shown += (target - self.pointer_shown) * 0.25;
+        if (self.pointer_shown - target).abs() < 0.02 {
+            self.pointer_shown = target;
+        }
+        self.pointer_shown
+    }
+
+    /// The USB mouse: moving it points (and selects what it's over),
+    /// clicking acts on it. Returns the controller buttons a click stands for.
+    fn pointer_input(&mut self, m: &MenuMouse, now: Instant) -> u32 {
+        let moved = m.dx != 0.0 || m.dy != 0.0;
+        if moved {
+            self.pointer.0 = (self.pointer.0 + m.dx as f32).clamp(0.0, W as f32 - 1.0);
+            self.pointer.1 = (self.pointer.1 + m.dy as f32).clamp(0.0, H as f32 - 1.0);
+        }
+        if moved || m.click {
+            self.pointer_moved = Some(now);
+        }
+        if !moved && !m.click {
+            return 0;
+        }
+        // The About page: a click anywhere goes back.
+        if self.about_page.is_some() {
+            return if m.click { PAD_CIRCLE } else { 0 };
+        }
+        let (px, py) = (self.pointer.0 as i32, self.pointer.1 as i32);
+        let Some(&(_, _, _, _, hit)) =
+            self.hits.iter().rev().find(|(x, y, w, h, _)| px >= *x && py >= *y && px < x + w && py < y + h)
+        else {
+            return 0;
+        };
+        // Pointing selects games, settings and controls rows.
+        match hit {
+            Hit::Game(vi) if self.editor.is_none() => {
+                if self.selected[self.tab] != vi {
+                    self.selected[self.tab] = vi;
+                    self.selection_changed = now;
+                }
+            }
+            Hit::Setting(i) | Hit::SettingLeft(i) if self.editor.is_none() => self.setting_sel = i,
+            Hit::Editor(i) | Hit::EditorLeft(i) => {
+                if let Some(ed) = self.editor.as_mut() {
+                    ed.sel = i;
+                }
+            }
+            Hit::Badge(i) => self.badge_sel = i,
+            _ => {}
+        }
+        if !m.click {
+            return 0;
+        }
+        match hit {
+            Hit::Tab(i) if self.editor.is_none() => {
+                if self.tab != i {
+                    self.tab = i;
+                    self.selection_changed = now;
+                }
+                0
+            }
+            Hit::Game(_) | Hit::Setting(_) | Hit::Editor(_) => PAD_CROSS,
+            Hit::SettingLeft(_) | Hit::EditorLeft(_) => PAD_LEFT,
+            Hit::Button(b) => b,
+            _ => 0,
+        }
+    }
+
+    /// Returns the game to start ("" for the built-in demo). Around the
+    /// menus themselves: the screensaver, typing to search, and the sounds.
+    pub fn handle_input(&mut self, f: &PadFrame, mouse: &MenuMouse) -> Option<String> {
         let now = Instant::now();
+        let stick = |v: u8| (v as i32 - 128).abs() > 40;
+        let active = f.pressed != 0
+            || f.held != 0
+            || stick(f.lx)
+            || stick(f.ly)
+            || stick(f.rx)
+            || stick(f.ry)
+            || mouse.dx != 0.0
+            || mouse.dy != 0.0
+            || mouse.click
+            || !mouse.typed.is_empty()
+            || mouse.backspace;
+        if active {
+            self.last_input = now;
+        }
+        if self.saver.is_some() {
+            if active {
+                self.saver = None;
+                sounds::play(Sfx::Wake);
+            }
+            return None;
+        }
+        if self.settings.screensaver
+            && self.editor.is_none()
+            && self.about_page.is_none()
+            && now.duration_since(self.last_input) >= SAVER_AFTER
+        {
+            self.saver = Some(now);
+            self.badges.stats.screensaver += 1;
+            self.badges.save();
+            self.check_badges();
+            sounds::play(Sfx::Sleep);
+            return None;
+        }
+        if self.search_input(f, mouse, now) {
+            return None;
+        }
+
+        // What the menus looked like before, to pick a sound after.
+        let before = (
+            self.tab,
+            self.selected[self.tab],
+            self.setting_sel,
+            self.open_category,
+            self.editor.as_ref().map(|e| e.sel),
+            self.about_page.is_some() && self.about_closing.is_none(),
+            self.badge_sel,
+            self.favorites.len(),
+            self.settings.clone(),
+        );
+        let editor_value = self.editor.as_ref().map(|e| e.controls.rows().map(|(_, _, b)| b.label()).collect::<Vec<_>>().join(",") + &e.controls.stick.to_string());
+        let result = self.handle_input_inner(f, mouse, now);
+
+        if result.is_some() {
+            sounds::play(Sfx::Launch);
+            return result;
+        }
+        let editor_now = self.editor.as_ref().map(|e| e.controls.rows().map(|(_, _, b)| b.label()).collect::<Vec<_>>().join(",") + &e.controls.stick.to_string());
+        let about_open = self.about_page.is_some() && self.about_closing.is_none();
+        let sfx = if self.tab != before.0 {
+            Some(Sfx::Tab)
+        } else if about_open != before.5 || self.open_category != before.3 || self.editor.is_some() != before.4.is_some() {
+            Some(if about_open && !before.5 || self.open_category.is_some() && before.3 != self.open_category || self.editor.is_some() && before.4.is_none() {
+                Sfx::Select
+            } else {
+                Sfx::Back
+            })
+        } else if self.settings != before.8 || self.favorites.len() != before.7 || editor_value != editor_now {
+            Some(Sfx::Toggle)
+        } else if self.selected[self.tab] != before.1
+            || self.setting_sel != before.2
+            || self.editor.as_ref().map(|e| e.sel) != before.4
+            || self.badge_sel != before.6
+        {
+            Some(Sfx::Move)
+        } else {
+            None
+        };
+        if let Some(sfx) = sfx {
+            sounds::play(sfx);
+        }
+
+        // Settings changes count for badges, and some apply at once.
+        if self.settings != before.8 {
+            let st = &mut self.badges.stats;
+            st.settings += 1;
+            st.themes_mask |= 1 << self.settings.theme;
+            st.accents_mask |= 1 << self.settings.accent;
+            gfx::set_accent(settings::ACCENTS[self.settings.accent as usize].1);
+            sounds::set_enabled(self.settings.ui_sounds);
+            self.badges.save();
+        }
+        if self.settings != before.8 || self.favorites.len() != before.7 {
+            self.check_badges();
+        }
+        None
+    }
+
+    /// Typing on a USB keyboard searches the Games tab: letters add, Backspace
+    /// removes, Esc (or Circle) clears. True when it took this frame.
+    fn search_input(&mut self, f: &PadFrame, m: &MenuMouse, now: Instant) -> bool {
+        if self.editor.is_some() || self.about_page.is_some() {
+            return false;
+        }
+        let mut changed = false;
+        for &c in &m.typed {
+            if self.search.is_empty() && !c.is_alphanumeric() {
+                continue;
+            }
+            if self.search.is_empty() {
+                self.badges.stats.searches += 1;
+                self.badges.save();
+            }
+            if self.search.chars().count() < 32 {
+                self.search.push(c);
+                changed = true;
+            }
+        }
+        if m.backspace && self.search.pop().is_some() {
+            changed = true;
+        }
+        if !self.search.is_empty() && f.just_pressed(PAD_CIRCLE) {
+            self.search.clear();
+            changed = true;
+        }
+        if !changed {
+            return false;
+        }
+        self.tab = GAMES_TAB;
+        self.selected[GAMES_TAB] = 0;
+        self.selection_changed = now;
+        sounds::play(if self.search.is_empty() { Sfx::Back } else { Sfx::Move });
+        self.check_badges();
+        true
+    }
+
+    fn handle_input_inner(&mut self, f: &PadFrame, mouse: &MenuMouse, now: Instant) -> Option<String> {
+        let clicked = self.pointer_input(mouse, now);
+        let merged = PadFrame { pressed: f.pressed | clicked, ..*f };
+        let f = &merged;
         let dir = self.dpad(f, now);
 
         // The About page: any of O, X or Options closes it (with a fade).
@@ -338,16 +772,38 @@ impl Library {
         }
 
         if f.just_pressed(PAD_L1) || f.just_pressed(PAD_R1) {
-            self.tab = if f.just_pressed(PAD_R1) {
-                (self.tab + 1) % TAB_COUNT
-            } else {
-                (self.tab + TAB_COUNT - 1) % TAB_COUNT
-            };
+            // Skipping a tab that's turned off (Badges).
+            loop {
+                self.tab = if f.just_pressed(PAD_R1) {
+                    (self.tab + 1) % TAB_COUNT
+                } else {
+                    (self.tab + TAB_COUNT - 1) % TAB_COUNT
+                };
+                if self.tab_enabled(self.tab) {
+                    break;
+                }
+            }
             self.selection_changed = now;
         }
 
         if TABS[self.tab].0 == Tab::Settings {
             self.settings_input(f, dir);
+            return None;
+        }
+        if TABS[self.tab].0 == Tab::Badges {
+            let (sel, n) = (self.badge_sel, BADGES.len());
+            if dir & PAD_RIGHT != 0 && (sel + 1) % BCOLS != 0 && sel + 1 < n {
+                self.badge_sel += 1;
+            }
+            if dir & PAD_LEFT != 0 && sel % BCOLS != 0 {
+                self.badge_sel -= 1;
+            }
+            if dir & PAD_DOWN != 0 {
+                self.badge_sel = (sel + BCOLS).min(n - 1);
+            }
+            if dir & PAD_UP != 0 && sel >= BCOLS {
+                self.badge_sel -= BCOLS;
+            }
             return None;
         }
 
@@ -482,6 +938,9 @@ impl Library {
         if f.just_pressed(PAD_CIRCLE) || f.just_pressed(PAD_OPTIONS) {
             let ed = self.editor.take().unwrap();
             ed.controls.save(&ed.key);
+            self.badges.stats.controls += 1;
+            self.badges.save();
+            self.check_badges();
             self.toast = Some((format!("Controls saved for {}", ed.name), Instant::now()));
         }
     }
@@ -612,6 +1071,19 @@ impl Library {
 
         let mut cv = std::mem::replace(&mut self.canvas, Canvas::new(0, 0));
         bg.draw(&mut cv, self.settings.waves);
+        self.hits.clear();
+        self.badges.enabled = self.settings.badges;
+        if !self.tab_enabled(self.tab) {
+            self.tab = TAB_COUNT - 1;
+        }
+
+        if let Some(since) = self.saver {
+            self.draw_screensaver(&mut cv, text, since);
+            self.badges.draw_popup(&mut cv, text);
+            bg.overlay(&mut cv);
+            self.canvas = cv;
+            return &self.canvas.px;
+        }
 
         if let Some(opened) = self.about_page {
             // Fades in over the settings, and back out.
@@ -624,6 +1096,9 @@ impl Library {
                 self.about_closing = None;
             } else {
                 self.draw_about_page(&mut cv, text, opened, fade);
+                self.badges.draw_popup(&mut cv, text);
+                bg.overlay(&mut cv);
+                self.draw_pointer(&mut cv);
                 self.canvas = cv;
                 return &self.canvas.px;
             }
@@ -640,7 +1115,10 @@ impl Library {
             self.draw_editor(&mut cv, text, k);
         } else if TABS[self.tab].0 == Tab::Settings {
             self.draw_settings(&mut cv, text);
+        } else if TABS[self.tab].0 == Tab::Badges {
+            self.draw_badges(&mut cv, text, k);
         } else {
+            self.draw_search(&mut cv, text);
             let vis = self.visible_for(self.tab);
             if vis.is_empty() {
                 self.draw_empty(&mut cv, text);
@@ -653,9 +1131,198 @@ impl Library {
             self.draw_panel(&mut cv, text);
         }
         self.draw_toast(&mut cv, text);
+        self.badges.draw_popup(&mut cv, text);
+        bg.overlay(&mut cv);
+        self.draw_pointer(&mut cv);
 
         self.canvas = cv;
         &self.canvas.px
+    }
+
+    /// The search box beside the tabs: what's typed, or how to start.
+    fn draw_search(&mut self, cv: &mut Canvas, text: &mut Text) {
+        if self.search.is_empty() && !self.keyboard_hints && !self.search_open {
+            return;
+        }
+        let (x, y, h) = (self.tabs_end + 24, 40, 64);
+        let w = PANEL_X - 64 - x;
+        if w < 200 {
+            return;
+        }
+        let active = !self.search.is_empty() || self.search_open;
+        cv.fill_rect(x, y, w, h, gfx::INK, if active { 0.6 } else { 0.35 });
+        if active {
+            cv.fill_rect(x, y + h - 3, w, 3, accent(), 1.0);
+        }
+        // A magnifying glass.
+        let (cx, cy) = ((x + 34) as f32, (y + 29) as f32);
+        cv.stroke_circle(cx, cy, 11.0, 3.0, WHITE, if active { 0.9 } else { 0.5 });
+        cv.line(cx + 8.0, cy + 8.0, cx + 16.0, cy + 16.0, 3.5, WHITE, if active { 0.9 } else { 0.5 });
+        let tx = x + 64;
+        if active {
+            let q = text.fit(Weight::SemiBold, 28, &self.search, w - 190);
+            let tw = text.draw(cv, Weight::SemiBold, 28, tx, y + 15, &q, WHITE, 1.0);
+            if self.start.elapsed().as_millis() % 1000 < 550 {
+                cv.fill_rect(tx + tw + 3, y + 16, 3, 32, accent(), 1.0);
+            }
+            let n = self.visible_for(GAMES_TAB).len();
+            let label = format!("{} found", n);
+            let lw = text.width(Weight::Regular, 20, &label);
+            text.draw(cv, Weight::Regular, 20, x + w - 20 - lw, y + 21, &label, WHITE, 0.6);
+        } else {
+            let hint = if self.keyboard_hints { "Type to search" } else { "L2 to search" };
+            text.draw(cv, Weight::Regular, 24, tx, y + 18, hint, WHITE, 0.45);
+        }
+    }
+
+    /// The Badges tab: a grid of medals, the chosen one in the panel.
+    fn draw_badges(&mut self, cv: &mut Canvas, text: &mut Text, k: f32) {
+        let live = self.live();
+        let sel = self.badge_sel;
+        let view = GRID_BOTTOM - GRID_Y;
+        let row_top = (sel / BCOLS) as i32 * BROW;
+        let mut target = self.badge_scroll;
+        if (row_top as f32) < target {
+            target = row_top as f32;
+        }
+        if (row_top + BROW) as f32 > target + view as f32 {
+            target = (row_top + BROW - view) as f32;
+        }
+        self.badge_scroll += (target - self.badge_scroll) * k;
+
+        for i in 0..BADGES.len() {
+            let (col, row) = ((i % BCOLS) as i32, (i / BCOLS) as i32);
+            let x = GRID_X + col * (BW + BGAP);
+            let y = GRID_Y + row * BROW - self.badge_scroll as i32;
+            let edge = ((y - (GRID_Y - 60)) as f32 / 60.0).min((H - y - 40) as f32 / 120.0).clamp(0.0, 1.0);
+            if edge <= 0.0 || y + BH < GRID_Y - 40 || y > H {
+                continue;
+            }
+            let unlocked = self.badges.unlocked_at(i).is_some();
+            let selected = i == sel;
+            if edge > 0.3 {
+                self.hits.push((x, y, BW, BH, Hit::Badge(i)));
+            }
+            cv.fill_round_rect(x, y, BW, BH, 18, gfx::INK, 0.5 * edge);
+            if selected {
+                cv.fill_round_rect(x, y, BW, BH, 18, WHITE, 0.1 * edge);
+                cv.stroke_round_rect(x - 6, y - 6, BW + 12, BH + 12, 22, 3, WHITE, edge);
+            }
+            let a = if unlocked || selected { 1.0 } else { 0.55 } * edge;
+            gfx::medal(cv, (x + BW / 2) as f32, (y + 68) as f32, 40.0, unlocked, a, i);
+            let name = text.fit(Weight::SemiBold, 22, BADGES[i].name, BW - 24);
+            let nw = text.width(Weight::SemiBold, 22, &name);
+            text.draw(cv, Weight::SemiBold, 22, x + (BW - nw) / 2, y + 122, &name, WHITE, a);
+            if unlocked {
+                let lw = text.width(Weight::SemiBold, 16, "UNLOCKED");
+                text.draw(cv, Weight::SemiBold, 16, x + (BW - lw) / 2, y + 162, "UNLOCKED", gfx::GOLD, a);
+            } else {
+                let (now, goal) = self.badges.progress(i, &live);
+                let bw = BW - 70;
+                let bx = x + 35;
+                cv.fill_round_rect(bx, y + 166, bw, 6, 3, WHITE, 0.15 * edge);
+                let fill = (bw as u64 * now / goal.max(1)) as i32;
+                if fill > 0 {
+                    cv.fill_round_rect(bx, y + 166, fill, 6, 3, accent(), a);
+                }
+            }
+        }
+
+        // The panel: the chosen badge, big.
+        cv.fill_round_rect(PANEL_X, PANEL_Y, PANEL_W, PANEL_H, 22, gfx::INK, 0.55);
+        cv.stroke_round_rect(PANEL_X, PANEL_Y, PANEL_W, PANEL_H, 22, 1, WHITE, 0.1);
+        let (ix, iw) = (PANEL_X + 28, PANEL_W - 56);
+        let mut y = PANEL_Y + 34;
+        text.draw(cv, Weight::SemiBold, 20, ix, y, "BADGES", accent(), 1.0);
+        y += 30;
+        let count = format!("{} of {}", self.badges.count(), BADGES.len());
+        text.draw(cv, Weight::Bold, 40, ix, y, &count, WHITE, 1.0);
+        y += 54;
+        let total = self.badges.count() as i32 * iw / BADGES.len() as i32;
+        cv.fill_round_rect(ix, y, iw, 8, 4, WHITE, 0.15);
+        if total > 0 {
+            cv.fill_round_rect(ix, y, total, 8, 4, gfx::GOLD, 1.0);
+        }
+        y += 60;
+        let unlocked = self.badges.unlocked_at(sel);
+        let t = self.start.elapsed().as_secs_f32();
+        if unlocked.is_some() {
+            gfx::rays(cv, (PANEL_X + PANEL_W / 2) as f32, (y + 90) as f32, 150.0, 12, t * 0.2, gfx::GOLD, 0.18);
+        }
+        gfx::medal(cv, (PANEL_X + PANEL_W / 2) as f32, (y + 90) as f32, 84.0, unlocked.is_some(), 1.0, sel);
+        y += 210;
+        for line in text.wrap(Weight::Bold, 34, BADGES[sel].name, iw, 2) {
+            text.draw(cv, Weight::Bold, 34, ix, y, &line, WHITE, 1.0);
+            y += 44;
+        }
+        y += 6;
+        for line in text.wrap(Weight::Regular, 24, BADGES[sel].about, iw, 3) {
+            text.draw(cv, Weight::Regular, 24, ix, y, &line, WHITE, 0.78);
+            y += 34;
+        }
+        y += 16;
+        match unlocked {
+            Some(at) => {
+                let label = format!("Unlocked {}", ago(at));
+                text.draw(cv, Weight::SemiBold, 24, ix, y, &label, gfx::GOLD, 1.0);
+            }
+            None => {
+                let (now, goal) = self.badges.progress(sel, &live);
+                cv.fill_round_rect(ix, y + 8, iw - 110, 10, 5, WHITE, 0.15);
+                let fill = ((iw - 110) as u64 * now / goal.max(1)) as i32;
+                if fill > 0 {
+                    cv.fill_round_rect(ix, y + 8, fill, 10, 5, accent(), 1.0);
+                }
+                let label = format!("{} / {}", now, goal);
+                let lw = text.width(Weight::SemiBold, 22, &label);
+                text.draw(cv, Weight::SemiBold, 22, ix + iw - lw, y, &label, WHITE, 0.85);
+            }
+        }
+        self.draw_panel_hints(cv, text, ix, iw, &[]);
+    }
+
+    /// The screensaver: the games' covers drifting slowly across the waves
+    /// at different depths, and a big clock.
+    fn draw_screensaver(&mut self, cv: &mut Canvas, text: &mut Text, since: Instant) {
+        let t = since.elapsed().as_secs_f32();
+        let a = ease(t / 1.5);
+        cv.fade(1.0 - 0.45 * a);
+        let n = self.games.len().min(14);
+        let mut items: Vec<(f32, usize, u64)> = (0..n)
+            .map(|i| {
+                let h = (i as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                (0.3 + 0.7 * ((h >> 20) % 100) as f32 / 100.0, i, h)
+            })
+            .collect();
+        items.sort_by(|p, q| p.0.partial_cmp(&q.0).unwrap_or(std::cmp::Ordering::Equal));
+        let span = (W + TILE_W + 300) as f32;
+        for (depth, gi, h) in items {
+            let speed = 10.0 + 34.0 * depth;
+            let x = ((h % 10_000) as f32 / 10_000.0 * span + t * speed) % span - TILE_W as f32 - 150.0;
+            let y = 60.0 + ((h >> 36) % 800) as f32 + (t * 0.21 + gi as f32).sin() * 26.0;
+            let alpha = a * (0.18 + 0.55 * depth);
+            if let Some(tile) = self.tile(text, gi, true) {
+                cv.draw_image_rounded(tile, x as i32, y.min((H - TILE_H) as f32) as i32, 14, alpha);
+            }
+        }
+        // The clock, breathing gently.
+        let (mut hh, mut mm) = (0, 0);
+        if unsafe { ruffle_ps5_clock(&mut hh, &mut mm) } == 0 {
+            let clock = format!("{:02}:{:02}", hh, mm);
+            let cw = text.width(Weight::Bold, 150, &clock);
+            let breathe = 0.8 + 0.2 * (t * 0.8).sin();
+            text.draw(cv, Weight::Bold, 150, (W - cw) / 2, 380, &clock, WHITE, a * breathe);
+        }
+        let label = "Ruffle Flash";
+        let lw = text.width(Weight::SemiBold, 30, label);
+        text.draw(cv, Weight::SemiBold, 30, (W - lw) / 2, 580, label, accent(), 0.8 * a);
+    }
+
+    fn draw_pointer(&mut self, cv: &mut Canvas) {
+        let a = self.pointer_alpha();
+        if a > 0.0 {
+            gfx::pointer(cv, self.pointer.0, self.pointer.1, a);
+        }
     }
 
     /// Flat tabs joined in a strip (PPSSPP style): the active one filled
@@ -669,6 +1336,10 @@ impl Library {
         let mut target = (0.0, 0.0);
         let mut xs = Vec::new();
         for (i, w) in labels.iter().enumerate() {
+            if !self.tab_enabled(i) {
+                xs.push(x);
+                continue;
+            }
             let tw = w + 2 * pad;
             cv.fill_rect(x, y, tw, h, gfx::INK, 0.45);
             if i > 0 {
@@ -677,18 +1348,23 @@ impl Library {
             if i == self.tab {
                 target = (x as f32, tw as f32);
             }
+            self.hits.push((x, y, tw, h, Hit::Tab(i)));
             xs.push(x);
             x += tw;
         }
+        self.tabs_end = x;
         if self.tab_pill.1 == 0.0 {
             self.tab_pill = target;
         }
         self.tab_pill.0 += (target.0 - self.tab_pill.0) * k;
         self.tab_pill.1 += (target.1 - self.tab_pill.1) * k;
-        cv.fill_rect(self.tab_pill.0 as i32, y, self.tab_pill.1.round() as i32, h, ORANGE, 1.0);
-        cv.fill_rect(GRID_X, y + h, PANEL_X - 64 - GRID_X, 3, ORANGE, 1.0);
+        cv.fill_rect(self.tab_pill.0 as i32, y, self.tab_pill.1.round() as i32, h, accent(), 1.0);
+        cv.fill_rect(GRID_X, y + h, PANEL_X - 64 - GRID_X, 3, accent(), 1.0);
 
         for (i, (_, label)) in TABS.iter().enumerate() {
+            if !self.tab_enabled(i) {
+                continue;
+            }
             let active = i == self.tab;
             text.draw(cv, Weight::SemiBold, 28, xs[i] + pad, y + 15, label, WHITE, if active { 1.0 } else { 0.7 });
         }
@@ -724,6 +1400,9 @@ impl Library {
             if vi == sel || fade <= 0.0 || y + TILE_H < GRID_Y - 30 || y > H {
                 continue;
             }
+            if fade > 0.3 && y + TILE_H > GRID_Y - 20 {
+                self.hits.push((x, y, TILE_W, TILE_H, Hit::Game(vi)));
+            }
             match self.tile(text, gi, false) {
                 Some(tile) => cv.draw_image_rounded(tile, x, y, 14, 0.5 * fade),
                 // Not made yet: a placeholder for a frame or two.
@@ -748,6 +1427,7 @@ impl Library {
         let big = &self.big_tile.as_ref().unwrap().1;
         let (bw, bh) = (big.w, big.h);
         let (bx, by) = (x - (bw - TILE_W) / 2, y - (bh - TILE_H) / 2);
+        self.hits.push((bx, by, bw, bh, Hit::Game(sel)));
         cv.glow(bx, by + 8, bw, bh, 16, 34, gfx::INK, 0.7 * fade);
         cv.draw_image_rounded(big, bx, by, 16, fade);
         let t = self.selection_changed.elapsed().as_secs_f32() % 4.5;
@@ -798,9 +1478,12 @@ impl Library {
             }
             let selected = i == self.setting_sel;
             let in_category = settings::category_of(i).is_some();
+            if edge > 0.3 {
+                self.hits.push((GRID_X + 10, y, list_w - 20, row_h - 4, Hit::Setting(i)));
+            }
             if selected {
                 cv.fill_round_rect(GRID_X + 10, y, list_w - 20, row_h - 4, 14, WHITE, 0.12 * edge);
-                cv.fill_round_rect(GRID_X + 10, y + 12, 5, row_h - 28, 3, ORANGE, edge);
+                cv.fill_round_rect(GRID_X + 10, y + 12, 5, row_h - 28, 3, accent(), edge);
             } else if p > 0 {
                 cv.fill_rect(GRID_X + 30, y - 2, list_w - 60, 1, WHITE, 0.07 * edge);
             }
@@ -812,15 +1495,15 @@ impl Library {
                 // pointing down when open.
                 let open = self.open_category == Some(i);
                 let a = if selected || open { 1.0 } else { 0.85 } * edge;
-                text.draw(cv, Weight::Bold, 28, GRID_X + 36, y + 14, title, if open { ORANGE } else { WHITE }, a);
+                text.draw(cv, Weight::Bold, 28, GRID_X + 36, y + 14, title, if open { accent() } else { WHITE }, a);
                 let n = (i + 1..settings::ROWS.len()).take_while(|&j| settings::category_of(j) == Some(i)).count();
                 let label = format!("{} settings", n);
                 let lw = text.width(Weight::Regular, 20, &label);
                 text.draw(cv, Weight::Regular, 20, right - lw - 34, y + 20, &label, WHITE, 0.5 * edge);
                 let cx = right as f32 - 6.0;
                 if open {
-                    cv.line(cx - 9.0, cy - 4.0, cx, cy + 5.0, 3.0, ORANGE, a);
-                    cv.line(cx, cy + 5.0, cx + 9.0, cy - 4.0, 3.0, ORANGE, a);
+                    cv.line(cx - 9.0, cy - 4.0, cx, cy + 5.0, 3.0, accent(), a);
+                    cv.line(cx, cy + 5.0, cx + 9.0, cy - 4.0, 3.0, accent(), a);
                 } else {
                     cv.line(cx - 4.0, cy - 9.0, cx + 5.0, cy, 3.0, WHITE, a);
                     cv.line(cx + 5.0, cy, cx - 4.0, cy + 9.0, 3.0, WHITE, a);
@@ -838,7 +1521,7 @@ impl Library {
             // Settings inside a category sit a step in.
             let lx = GRID_X + if in_category { 64 } else { 36 };
             if in_category {
-                cv.fill_rect(GRID_X + 40, y + 8, 2, row_h - 16, ORANGE, 0.35 * edge);
+                cv.fill_rect(GRID_X + 40, y + 8, 2, row_h - 16, accent(), 0.35 * edge);
             }
             text.draw(cv, Weight::SemiBold, 26, lx, y + 16, row.label(), WHITE, a);
             if row.is_action() {
@@ -853,10 +1536,13 @@ impl Library {
                 let rx = right as f32 - 6.0;
                 let lx = (right - vw - 44) as f32;
                 let ca = if selected { 1.0 } else { 0.35 };
-                cv.line(rx - 6.0, cy - 8.0, rx + 2.0, cy, 3.0, ORANGE, ca);
-                cv.line(rx + 2.0, cy, rx - 6.0, cy + 8.0, 3.0, ORANGE, ca);
-                cv.line(lx + 6.0, cy - 8.0, lx - 2.0, cy, 3.0, ORANGE, ca);
-                cv.line(lx - 2.0, cy, lx + 6.0, cy + 8.0, 3.0, ORANGE, ca);
+                if edge > 0.3 {
+                    self.hits.push((lx as i32 - 26, y, 52, row_h - 4, Hit::SettingLeft(i)));
+                }
+                cv.line(rx - 6.0, cy - 8.0, rx + 2.0, cy, 3.0, accent(), ca);
+                cv.line(rx + 2.0, cy, rx - 6.0, cy + 8.0, 3.0, accent(), ca);
+                cv.line(lx + 6.0, cy - 8.0, lx - 2.0, cy, 3.0, accent(), ca);
+                cv.line(lx - 2.0, cy, lx + 6.0, cy + 8.0, 3.0, accent(), ca);
                 text.draw(cv, Weight::SemiBold, 26, right - vw - 22, y + 16, &value, WHITE, a);
             }
         }
@@ -883,7 +1569,7 @@ impl Library {
         if !value.is_empty() {
             y += 6;
             for line in text.wrap(Weight::Bold, 44, &value, iw, 2) {
-                text.draw(cv, Weight::Bold, 44, ix, y, &line, ORANGE, 1.0);
+                text.draw(cv, Weight::Bold, 44, ix, y, &line, accent(), 1.0);
                 y += 56;
             }
             y += 6;
@@ -907,7 +1593,7 @@ impl Library {
     /// A category's panel: what it's for, and its settings at a glance.
     fn draw_category_panel(&mut self, cv: &mut Canvas, text: &mut Text, ix: i32, iw: i32, title: &str) {
         let mut y = PANEL_Y + 34;
-        text.draw(cv, Weight::SemiBold, 20, ix, y, "CATEGORY", ORANGE, 1.0);
+        text.draw(cv, Weight::SemiBold, 20, ix, y, "CATEGORY", accent(), 1.0);
         y += 32;
         text.draw(cv, Weight::Bold, 40, ix, y, title, WHITE, 1.0);
         y += 60;
@@ -928,7 +1614,7 @@ impl Library {
             if !value.is_empty() {
                 let v = text.fit(Weight::SemiBold, 21, &value, iw / 2);
                 let vw = text.width(Weight::SemiBold, 21, &v);
-                text.draw(cv, Weight::SemiBold, 21, ix + iw - vw, y, &v, ORANGE, 1.0);
+                text.draw(cv, Weight::SemiBold, 21, ix + iw - vw, y, &v, accent(), 1.0);
             }
             y += 38;
         }
@@ -938,24 +1624,16 @@ impl Library {
     }
 
     /// Button hints at the bottom of the settings panel, then "Switch tabs".
-    fn draw_panel_hints(&self, cv: &mut Canvas, text: &mut Text, ix: i32, iw: i32, hint: &[(Option<PadIcon>, &str, &str)]) {
+    fn draw_panel_hints(&mut self, cv: &mut Canvas, text: &mut Text, ix: i32, iw: i32, hint: &[(Option<PadIcon>, &str, &str)]) {
         let row_h = 60;
         let mut ry = PANEL_Y + PANEL_H - 16 - (hint.len() as i32 + 1) * row_h;
         for (icon, chip, label) in hint.iter().chain([(None, "L1 R1", "Switch tabs")].iter()) {
             cv.fill_rect(ix, ry, iw, 1, WHITE, 0.08);
             let cy = ry + row_h / 2;
-            let lead = match icon {
-                Some(ic) => {
-                    gfx::pad_icon(cv, *ic, (ix + 18) as f32, cy as f32, 17.0);
-                    48
-                }
-                None => {
-                    let cw = text.width(Weight::SemiBold, 15, chip) + 18;
-                    cv.stroke_round_rect(ix, cy - 14, cw, 28, 7, 2, WHITE, 0.45);
-                    text.draw(cv, Weight::SemiBold, 15, ix + 9, cy - 9, chip, WHITE, 0.75);
-                    cw + 14
-                }
-            };
+            if let Some(b) = button_of(*icon, chip) {
+                self.hits.push((ix - 12, ry, iw + 24, row_h, Hit::Button(b)));
+            }
+            let lead = draw_hint_lead(cv, text, *icon, chip, self.keyboard_hints, ix, cy);
             text.draw(cv, Weight::SemiBold, 26, ix + lead, cy - 16, label, WHITE, 0.85);
             ry += row_h;
         }
@@ -1024,7 +1702,7 @@ impl Library {
         let tx = 960 - (w1 + w2) / 2;
         let ty = 455 + ((1.0 - ta) * 16.0) as i32;
         text.draw(cv, Weight::Bold, 72, tx, ty, "Ruffle ", WHITE, ta);
-        text.draw(cv, Weight::Bold, 72, tx + w1, ty, "Flash", ORANGE, ta);
+        text.draw(cv, Weight::Bold, 72, tx + w1, ty, "Flash", accent(), ta);
         let version = format!("Version {}  \u{00B7}  for PS5", env!("CARGO_PKG_VERSION"));
         let vw = text.width(Weight::Regular, 26, &version);
         text.draw(cv, Weight::Regular, 26, 960 - vw / 2, ty + 96, &version, WHITE, 0.6 * ta);
@@ -1048,7 +1726,7 @@ impl Library {
             let col_x = x0 + i as i32 * col_w;
             let rl = role.to_uppercase();
             let rw = text.width(Weight::SemiBold, 18, &rl);
-            text.draw(cv, Weight::SemiBold, 18, col_x + (col_w - rw) / 2, cy0, &rl, ORANGE, ca);
+            text.draw(cv, Weight::SemiBold, 18, col_x + (col_w - rw) / 2, cy0, &rl, accent(), ca);
             for (j, line) in text.wrap(Weight::SemiBold, 26, who, col_w - 40, 2).iter().enumerate() {
                 let lw = text.width(Weight::SemiBold, 26, line);
                 text.draw(cv, Weight::SemiBold, 26, col_x + (col_w - lw) / 2, cy0 + 32 + j as i32 * 34, line, WHITE, ca);
@@ -1062,11 +1740,15 @@ impl Library {
 
         // Back.
         let ba = part(1.2);
-        let label = "Back";
+        let label = if self.keyboard_hints { "Esc  Back" } else { "Back" };
         let lw = text.width(Weight::SemiBold, 24, label);
-        let bx = 960 - (34 + 12 + lw) / 2;
-        gfx::pad_icon(cv, PadIcon::Circle, (bx + 16) as f32, 1003.0, 16.0 * ba.max(0.01));
-        text.draw(cv, Weight::SemiBold, 24, bx + 46, 989, label, WHITE, 0.85 * ba);
+        if self.keyboard_hints {
+            text.draw(cv, Weight::SemiBold, 24, 960 - lw / 2, 989, label, WHITE, 0.85 * ba);
+        } else {
+            let bx = 960 - (34 + 12 + lw) / 2;
+            gfx::pad_icon(cv, PadIcon::Circle, (bx + 16) as f32, 1003.0, 16.0 * ba.max(0.01));
+            text.draw(cv, Weight::SemiBold, 24, bx + 46, 989, label, WHITE, 0.85 * ba);
+        }
     }
 
     /// About: the logo, the app's name and version, credits and folders.
@@ -1081,7 +1763,7 @@ impl Library {
         // A soft orange glow behind it.
         for i in 0..12 {
             let r = 100.0 - i as f32 * 7.0;
-            cv.fill_circle((lx + logo.w / 2) as f32, (ly + logo.h / 2) as f32, r, ORANGE, 0.018);
+            cv.fill_circle((lx + logo.w / 2) as f32, (ly + logo.h / 2) as f32, r, accent(), 0.018);
         }
         cv.draw_image(logo, lx, ly);
 
@@ -1089,7 +1771,7 @@ impl Library {
         let title_w = text.width(Weight::Bold, 36, "Ruffle ") + text.width(Weight::Bold, 36, "Flash");
         let tx = PANEL_X + (PANEL_W - title_w) / 2;
         let w = text.draw(cv, Weight::Bold, 36, tx, y, "Ruffle ", WHITE, 1.0);
-        text.draw(cv, Weight::Bold, 36, tx + w, y, "Flash", ORANGE, 1.0);
+        text.draw(cv, Weight::Bold, 36, tx + w, y, "Flash", accent(), 1.0);
         y += 50;
         let version = format!("Version {} for PS5", env!("CARGO_PKG_VERSION"));
         let vw = text.width(Weight::Regular, 22, &version);
@@ -1103,7 +1785,7 @@ impl Library {
         y += 18;
         for (role, who) in settings::CREDITS {
             cv.fill_rect(ix, y - 10, iw, 1, WHITE, 0.08);
-            text.draw(cv, Weight::SemiBold, 18, ix, y, &role.to_uppercase(), ORANGE, 1.0);
+            text.draw(cv, Weight::SemiBold, 18, ix, y, &role.to_uppercase(), accent(), 1.0);
             y += 26;
             for line in text.wrap(Weight::SemiBold, 24, who, iw, 2) {
                 text.draw(cv, Weight::SemiBold, 24, ix, y, &line, WHITE, 0.95);
@@ -1120,16 +1802,18 @@ impl Library {
 
     fn draw_favorite_dot(&self, cv: &mut Canvas, gi: usize, right: i32, top: i32, alpha: f32) {
         if self.favorites.contains(&self.games[gi].path) {
-            cv.fill_circle((right - 20) as f32, (top + 20) as f32, 10.0, ORANGE, alpha);
+            cv.fill_circle((right - 20) as f32, (top + 20) as f32, 10.0, accent(), alpha);
             cv.fill_circle((right - 20) as f32, (top + 20) as f32, 3.5, WHITE, alpha);
         }
     }
 
     fn draw_empty(&mut self, cv: &mut Canvas, text: &mut Text) {
+        let no_match = format!("Nothing is called \"{}\". Backspace to change it, Esc to clear.", self.search);
         let (title, line) = match TABS[self.tab].0 {
+            Tab::Games if !self.search.is_empty() => ("No matches", no_match.as_str()),
             Tab::Favorites => ("No favorites yet", "Press the triangle button on a game to keep it here."),
             Tab::Recent => ("Nothing played yet", "The games you play show up here."),
-            Tab::Games | Tab::Settings => ("No games yet", "Copy .swf files to /data/ruffle/games or a USB drive's ruffle folder."),
+            Tab::Games | Tab::Settings | Tab::Badges => ("No games yet", "Copy .swf files to /data/ruffle/games or a USB drive's ruffle folder."),
         };
         text.draw(cv, Weight::Bold, 60, GRID_X, 360, title, WHITE, 1.0);
         let lines = text.wrap(Weight::Regular, 26, line, PANEL_X - GRID_X - 80, 2);
@@ -1148,10 +1832,10 @@ impl Library {
         let glow = if t < 0.8 { (t / 0.8 * std::f32::consts::PI).sin() } else { 0.0 };
         if glow > 0.0 {
             for (dx, dy) in [(-2, 0), (2, 0), (0, -2), (0, 2)] {
-                text.draw(cv, Weight::Bold, 40, x + dx, y + dy, "Flash", ORANGE_LIGHT, 0.25 * glow);
+                text.draw(cv, Weight::Bold, 40, x + dx, y + dy, "Flash", accent_light(), 0.25 * glow);
             }
         }
-        x += text.draw(cv, Weight::Bold, 40, x, y, "Flash", ORANGE, 1.0) + 12;
+        x += text.draw(cv, Weight::Bold, 40, x, y, "Flash", accent(), 1.0) + 12;
         cv.stroke_round_rect(x, y + 12, 46, 26, 7, 2, WHITE, 0.5);
         text.draw(cv, Weight::SemiBold, 15, x + 9, y + 16, "PS5", WHITE, 0.8);
 
@@ -1187,7 +1871,7 @@ impl Library {
 
         if size.is_some() && self.favorites.contains(&path) {
             let w = text.width(Weight::SemiBold, 16, "FAVORITE") + 22;
-            cv.fill_round_rect(inner_x, y, w, 28, 14, ORANGE, 1.0);
+            cv.fill_round_rect(inner_x, y, w, 28, 14, accent(), 1.0);
             text.draw(cv, Weight::SemiBold, 16, inner_x + 11, y + 5, "FAVORITE", WHITE, 1.0);
             y += 42;
         }
@@ -1199,7 +1883,10 @@ impl Library {
                     Some((_, t)) => format!("Played {}", ago(*t)),
                     None => "Not played yet".into(),
                 },
-            ],
+            ]
+            .into_iter()
+            .chain(self.playtime.get(&key).filter(|s| **s > 0).map(|s| format!("{} played", format_play(*s))))
+            .collect(),
             None => vec!["Flash games on PS5".into(), "Games go in /data/ruffle/games".into()],
         };
         for d in details {
@@ -1224,6 +1911,9 @@ impl Library {
         if size.is_some() {
             rows.push((None, "Options", "Controls".into()));
         }
+        if !self.keyboard_hints {
+            rows.push((None, "L2", "Search".into()));
+        }
         rows.push((None, "L1 R1", "Switch tabs".into()));
 
         let row_h = 58;
@@ -1235,18 +1925,10 @@ impl Library {
                 cv.fill_rect(inner_x, ry, inner_w, 1, WHITE, 0.08);
             }
             let cy = ry + row_h / 2;
-            let lead = match icon {
-                Some(ic) => {
-                    gfx::pad_icon(cv, *ic, (inner_x + 18) as f32, cy as f32, 17.0);
-                    48
-                }
-                None => {
-                    let cw = text.width(Weight::SemiBold, 15, chip) + 18;
-                    cv.stroke_round_rect(inner_x, cy - 14, cw, 28, 7, 2, WHITE, 0.45);
-                    text.draw(cv, Weight::SemiBold, 15, inner_x + 9, cy - 9, chip, WHITE, 0.75);
-                    cw + 14
-                }
-            };
+            if let Some(b) = button_of(*icon, chip) {
+                self.hits.push((PANEL_X + 12, ry, PANEL_W - 24, row_h, Hit::Button(b)));
+            }
+            let lead = draw_hint_lead(cv, text, *icon, chip, self.keyboard_hints, inner_x, cy);
             text.draw(cv, Weight::SemiBold, 26, inner_x + lead, cy - 16, label, WHITE, if i == 0 { 1.0 } else { 0.85 });
             ry += row_h;
         }
@@ -1285,23 +1967,29 @@ impl Library {
                 continue;
             }
             let selected = vi == sel;
+            if a > 0.3 {
+                self.hits.push((GRID_X + 10, y, list_w - 20, row_h - 4, Hit::Game(vi)));
+            }
             if selected {
                 cv.fill_round_rect(GRID_X + 10, y, list_w - 20, row_h - 4, 14, WHITE, 0.12 * a);
-                cv.fill_round_rect(GRID_X + 10, y + 14, 5, row_h - 32, 3, ORANGE, a);
+                cv.fill_round_rect(GRID_X + 10, y + 14, 5, row_h - 32, 3, accent(), a);
             } else if vi > 0 {
                 cv.fill_rect(GRID_X + 30, y - 2, list_w - 60, 1, WHITE, 0.07 * a);
             }
             let g = &self.games[gi];
-            let details = match self.recent.iter().find(|(p, _)| *p == g.path) {
+            let mut details = match self.recent.iter().find(|(p, _)| *p == g.path) {
                 Some((_, t)) => format!("{}   \u{00B7}   {}", format_size(g.size), ago(*t)),
                 None => format_size(g.size),
             };
+            if let Some(secs) = self.playtime.get(&g.key).filter(|s| **s > 0) {
+                details = format!("{}   \u{00B7}   {}", format_play(*secs), details);
+            }
             let dw = text.width(Weight::Regular, 22, &details);
             let right = GRID_X + list_w - 36;
             text.draw(cv, Weight::Regular, 22, right - dw, y + 22, &details, WHITE, 0.6 * a);
             let mut nx = GRID_X + 36;
             if self.favorites.contains(&g.path) {
-                cv.fill_circle((nx + 6) as f32, (y + row_h / 2 - 2) as f32, 6.0, ORANGE, a);
+                cv.fill_circle((nx + 6) as f32, (y + row_h / 2 - 2) as f32, 6.0, accent(), a);
                 nx += 26;
             }
             let name = text.fit(Weight::SemiBold, 28, &g.name, right - dw - 40 - nx);
@@ -1348,9 +2036,12 @@ impl Library {
                 continue;
             }
             let selected = i == sel;
+            if edge > 0.3 {
+                self.hits.push((GRID_X + 10, y, list_w - 20, row_h - 4, Hit::Editor(i)));
+            }
             if selected {
                 cv.fill_round_rect(GRID_X + 10, y, list_w - 20, row_h - 4, 14, WHITE, 0.12 * edge);
-                cv.fill_round_rect(GRID_X + 10, y + 12, 5, row_h - 28, 3, ORANGE, edge);
+                cv.fill_round_rect(GRID_X + 10, y + 12, 5, row_h - 28, 3, accent(), edge);
             } else if i > 0 {
                 cv.fill_rect(GRID_X + 30, y - 2, list_w - 60, 1, WHITE, 0.07 * edge);
             }
@@ -1361,10 +2052,13 @@ impl Library {
             let cy = (y + row_h / 2 - 2) as f32;
             let (rx, lx) = (right as f32 - 6.0, (right - vw - 44) as f32);
             let ca = if selected { 1.0 } else { 0.35 } * edge;
-            cv.line(rx - 6.0, cy - 8.0, rx + 2.0, cy, 3.0, ORANGE, ca);
-            cv.line(rx + 2.0, cy, rx - 6.0, cy + 8.0, 3.0, ORANGE, ca);
-            cv.line(lx + 6.0, cy - 8.0, lx - 2.0, cy, 3.0, ORANGE, ca);
-            cv.line(lx - 2.0, cy, lx + 6.0, cy + 8.0, 3.0, ORANGE, ca);
+            if edge > 0.3 {
+                self.hits.push((lx as i32 - 26, y, 52, row_h - 4, Hit::EditorLeft(i)));
+            }
+            cv.line(rx - 6.0, cy - 8.0, rx + 2.0, cy, 3.0, accent(), ca);
+            cv.line(rx + 2.0, cy, rx - 6.0, cy + 8.0, 3.0, accent(), ca);
+            cv.line(lx + 6.0, cy - 8.0, lx - 2.0, cy, 3.0, accent(), ca);
+            cv.line(lx - 2.0, cy, lx + 6.0, cy + 8.0, 3.0, accent(), ca);
             let color = if value == "Nothing" { [0x99, 0x99, 0x99] } else { WHITE };
             text.draw(cv, Weight::SemiBold, 26, right - vw - 22, y + 14, value, color, a);
         }
@@ -1374,7 +2068,7 @@ impl Library {
         cv.stroke_round_rect(PANEL_X, PANEL_Y, PANEL_W, PANEL_H, 22, 1, WHITE, 0.1);
         let (ix, iw) = (PANEL_X + 28, PANEL_W - 56);
         let mut y = PANEL_Y + 34;
-        text.draw(cv, Weight::SemiBold, 20, ix, y, "CONTROLS", ORANGE, 1.0);
+        text.draw(cv, Weight::SemiBold, 20, ix, y, "CONTROLS", accent(), 1.0);
         y += 34;
         for line in text.wrap(Weight::Bold, 34, &game_name, iw, 2) {
             text.draw(cv, Weight::Bold, 34, ix, y, &line, WHITE, 1.0);
@@ -1385,7 +2079,7 @@ impl Library {
         text.draw(cv, Weight::SemiBold, 24, ix, y, name, WHITE, 0.7);
         y += 36;
         for line in text.wrap(Weight::Bold, 40, value, iw, 2) {
-            text.draw(cv, Weight::Bold, 40, ix, y, &line, ORANGE, 1.0);
+            text.draw(cv, Weight::Bold, 40, ix, y, &line, accent(), 1.0);
             y += 50;
         }
         y += 14;
@@ -1410,18 +2104,10 @@ impl Library {
         for (icon, chip, label) in hints {
             cv.fill_rect(ix, ry, iw, 1, WHITE, 0.08);
             let cy = ry + row_h / 2;
-            let lead = match icon {
-                Some(ic) => {
-                    gfx::pad_icon(cv, ic, (ix + 18) as f32, cy as f32, 17.0);
-                    48
-                }
-                None => {
-                    let cw = text.width(Weight::SemiBold, 15, chip) + 18;
-                    cv.stroke_round_rect(ix, cy - 14, cw, 28, 7, 2, WHITE, 0.45);
-                    text.draw(cv, Weight::SemiBold, 15, ix + 9, cy - 9, chip, WHITE, 0.75);
-                    cw + 14
-                }
-            };
+            if let Some(b) = button_of(icon, chip) {
+                self.hits.push((ix - 12, ry, iw + 24, row_h, Hit::Button(b)));
+            }
+            let lead = draw_hint_lead(cv, text, icon, chip, self.keyboard_hints, ix, cy);
             text.draw(cv, Weight::SemiBold, 26, ix + lead, cy - 16, label, WHITE, 0.85);
             ry += row_h;
         }
@@ -1438,7 +2124,7 @@ impl Library {
         let w = text.width(Weight::SemiBold, 24, &msg) + 56;
         let (x, y) = (GRID_X, H - 40 - 56 + ((1.0 - a) * 20.0) as i32);
         cv.fill_round_rect(x, y, w, 56, 28, gfx::INK, 0.85 * a);
-        cv.fill_circle((x + 26) as f32, (y + 28) as f32, 6.0, ORANGE, a);
+        cv.fill_circle((x + 26) as f32, (y + 28) as f32, 6.0, accent(), a);
         text.draw(cv, Weight::SemiBold, 24, x + 42, y + 14, &msg, WHITE, a);
     }
 }

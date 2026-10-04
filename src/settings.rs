@@ -1,4 +1,4 @@
-﻿//! App settings, kept in /data/ruffle/settings.txt as key=value lines. The
+//! App settings, kept in /data/ruffle/settings.txt as key=value lines. The
 //! Display and Player options are Ruffle's own (as in Ruffle on PC).
 
 use std::fs;
@@ -23,8 +23,14 @@ pub enum Row {
     SpoofSite,
     Volume,
     CursorSpeed,
+    MouseSpeed,
     DefaultControls,
     AutoKeyboard,
+    Theme,
+    Accent,
+    UiSounds,
+    Screensaver,
+    Badges,
     FpsCounter,
     AutoCovers,
     Waves,
@@ -35,7 +41,7 @@ pub enum Row {
 
 /// Categories (headers) each followed by their settings; the list shows one
 /// category open at a time. About stands on its own at the end.
-pub const ROWS: [Row; 28] = [
+pub const ROWS: [Row; 34] = [
     Row::Header("Display"),
     Row::ScaleMode,
     Row::ForceScale,
@@ -54,9 +60,15 @@ pub const ROWS: [Row; 28] = [
     Row::Header("Controls & Sound"),
     Row::DefaultControls,
     Row::CursorSpeed,
+    Row::MouseSpeed,
     Row::AutoKeyboard,
     Row::Volume,
     Row::Header("App"),
+    Row::Theme,
+    Row::Accent,
+    Row::UiSounds,
+    Row::Screensaver,
+    Row::Badges,
     Row::FpsCounter,
     Row::AutoCovers,
     Row::Waves,
@@ -71,8 +83,8 @@ pub fn header_help(name: &str) -> &'static str {
     match name {
         "Display" => "How games fill the screen and how smooth their edges look.",
         "Player" => "How Ruffle runs games: speed, Flash version, and helpers for games that won't start.",
-        "Controls & Sound" => "What the controller does in games, the on-screen keyboard, and volume.",
-        "App" => "The app itself: covers, the animated background and the FPS counter.",
+        "Controls & Sound" => "What the controller, a USB mouse and keyboard do in games, the on-screen keyboard, and volume.",
+        "App" => "The app itself: theme, accent colour, sounds, screensaver, covers and the FPS counter.",
         "Library" => "Your game list: look for new games, or clear what you played recently.",
         _ => "",
     }
@@ -118,6 +130,17 @@ pub const RUNTIMES: [&str; 2] = ["Flash Player", "Adobe AIR"];
 pub const LOAD_BEHAVIORS: [&str; 3] = ["Streaming", "Delayed", "Blocking"];
 pub const MAX_EXECUTION: [u32; 6] = [5, 10, 15, 20, 30, 60];
 pub const CURSOR_SPEEDS: [&str; 3] = ["Slow", "Normal", "Fast"];
+/// Accent colours: name and colour.
+pub const ACCENTS: [(&str, [u8; 3]); 7] = [
+    ("Ember orange", [0xF2, 0x6B, 0x1D]),
+    ("Ocean blue", [0x2F, 0x8C, 0xFF]),
+    ("Violet", [0x9B, 0x5C, 0xFF]),
+    ("Mint", [0x2E, 0xD1, 0xA0]),
+    ("Cherry red", [0xF0, 0x3A, 0x4A]),
+    ("Sakura pink", [0xFF, 0x6E, 0xB4]),
+    ("Gold", [0xF5, 0xB8, 0x2E]),
+];
+pub const MOUSE_SPEEDS: [&str; 5] = ["Slowest", "Slow", "Normal", "Fast", "Fastest"];
 /// Sites a sitelocked game may insist on, and where its file seems to come
 /// from there (the game's own file name is appended).
 pub const SPOOF_SITES: [(&str, &str); 7] = [
@@ -148,12 +171,20 @@ pub struct Settings {
     /// 0..=10, tenths.
     pub volume: u8,
     pub cursor_speed: u8,
+    /// A USB mouse's speed (MOUSE_SPEEDS).
+    pub mouse_speed: u8,
     pub auto_keyboard: bool,
     /// The library shows a list instead of the cover grid.
     pub list_view: bool,
     pub fps_counter: bool,
     pub auto_covers: bool,
     pub waves: bool,
+    pub theme: u8,
+    pub accent: u8,
+    pub ui_sounds: bool,
+    pub screensaver: bool,
+    /// Badges on: the Badges tab and unlock popups.
+    pub badges: bool,
 }
 
 impl Default for Settings {
@@ -174,11 +205,17 @@ impl Default for Settings {
             spoof_site: 0,
             volume: 10,
             cursor_speed: 1,
+            mouse_speed: 2,
             auto_keyboard: true,
             list_view: true,
             fps_counter: false,
             auto_covers: true,
             waves: true,
+            theme: 0,
+            accent: 0,
+            ui_sounds: true,
+            screensaver: true,
+            badges: true,
         }
     }
 }
@@ -211,8 +248,14 @@ impl Row {
             Row::SpoofSite => "Pretend to be on",
             Row::Volume => "Game volume",
             Row::CursorSpeed => "Cursor speed",
+            Row::MouseSpeed => "Mouse speed",
             Row::AutoKeyboard => "Keyboard for text boxes",
             Row::DefaultControls => "Default controls",
+            Row::Theme => "Theme",
+            Row::Accent => "Accent colour",
+            Row::UiSounds => "Menu sounds",
+            Row::Screensaver => "Screensaver",
+            Row::Badges => "Badges",
             Row::FpsCounter => "FPS counter",
             Row::AutoCovers => "Automatic covers",
             Row::Waves => "Animated background",
@@ -245,8 +288,14 @@ impl Row {
             Row::SpoofSite => "Makes a game believe it runs on this site. Many games only start on the site they were made for and show a \"play on our site\" screen anywhere else.",
             Row::Volume => "Volume of every game's sound and music.",
             Row::CursorSpeed => "How fast the left stick moves the mouse cursor in games.",
+            Row::MouseSpeed => "How fast a USB mouse moves the cursor in games. Plug a mouse or keyboard into the PS5 and it just works: the mouse points and clicks, the keyboard types and plays.",
             Row::DefaultControls => "What each button does in every game that has no controls of its own. Out of the box: Cross clicks, Circle Z, Square Space, Triangle Enter, L1 Shift, R1 X, R2 O, D-Pad arrows, Options Esc, Create P, L3 Ctrl. A game's own controls (Options on it in the library) start from these.",
             Row::AutoKeyboard => "Opens the on-screen keyboard by itself when you click a box in a game you can type in (a name, a code). Close it with O and it stays closed for that game.",
+            Row::Theme => "The look of the menus. Ember is warm, Midnight is deep blue, Retro CRT glows green with scanlines like an old screen, Newgrounds Dark is plain charcoal.",
+            Row::Accent => "The colour of tabs, highlights, bars and values all over the app.",
+            Row::UiSounds => "Soft, quiet sounds when you move around the menus, open things and unlock badges.",
+            Row::Screensaver => "After two minutes without input in the menus, your games' covers drift slowly across the screen. Any button wakes it.",
+            Row::Badges => "Little goals to unlock while you play, each with its own medal. Off hides the Badges tab and the unlock popups (your progress is still kept).",
             Row::FpsCounter => "Shows the game's frame rate in the corner while playing.",
             Row::AutoCovers => "Saves a picture of a game as its cover 8 seconds into its first run. R3 in a game always retakes it.",
             Row::Waves => "The flowing light waves behind the menus.",
@@ -281,12 +330,18 @@ impl Settings {
                 "spoof_site" => s.spoof_site = n.min(SPOOF_SITES.len() as u8 - 1),
                 "volume" => s.volume = n.min(10),
                 "cursor_speed" => s.cursor_speed = n.min(2),
+                "mouse_speed" => s.mouse_speed = n.min(MOUSE_SPEEDS.len() as u8 - 1),
                 "auto_keyboard" => s.auto_keyboard = n != 0,
                 // (The old "list_view" key is ignored: list is the default now.)
                 "library_list" => s.list_view = n != 0,
                 "fps_counter" => s.fps_counter = n != 0,
                 "auto_covers" => s.auto_covers = n != 0,
                 "waves" => s.waves = n != 0,
+                "theme" => s.theme = n.min(crate::ui::gfx::THEMES.len() as u8 - 1),
+                "accent" => s.accent = n.min(ACCENTS.len() as u8 - 1),
+                "ui_sounds" => s.ui_sounds = n != 0,
+                "screensaver" => s.screensaver = n != 0,
+                "badges" => s.badges = n != 0,
                 _ => {}
             }
         }
@@ -294,7 +349,7 @@ impl Settings {
     }
 
     pub fn save(&self) {
-        let fields: [(&str, u8); 20] = [
+        let fields: [(&str, u8); 26] = [
             ("auto_keyboard", self.auto_keyboard as u8),
             ("library_list", self.list_view as u8),
             ("dummy_external_interface", self.dummy_external_interface as u8),
@@ -312,9 +367,15 @@ impl Settings {
             ("max_execution", self.max_execution),
             ("volume", self.volume),
             ("cursor_speed", self.cursor_speed),
+            ("mouse_speed", self.mouse_speed),
             ("fps_counter", self.fps_counter as u8),
             ("auto_covers", self.auto_covers as u8),
             ("waves", self.waves as u8),
+            ("theme", self.theme),
+            ("accent", self.accent),
+            ("ui_sounds", self.ui_sounds as u8),
+            ("screensaver", self.screensaver as u8),
+            ("badges", self.badges as u8),
         ];
         let body: String = fields.iter().map(|(k, v)| format!("{}={}\n", k, v)).collect();
         if let Err(e) = fs::write(FILE, body) {
@@ -346,7 +407,13 @@ impl Settings {
             Row::SpoofSite => SPOOF_SITES[self.spoof_site as usize].0.into(),
             Row::Volume => format!("{}%", self.volume as u32 * 10),
             Row::CursorSpeed => CURSOR_SPEEDS[self.cursor_speed as usize].into(),
+            Row::MouseSpeed => MOUSE_SPEEDS[self.mouse_speed as usize].into(),
             Row::AutoKeyboard => on(self.auto_keyboard),
+            Row::Theme => crate::ui::gfx::THEMES[self.theme as usize].0.into(),
+            Row::Accent => ACCENTS[self.accent as usize].0.into(),
+            Row::UiSounds => on(self.ui_sounds),
+            Row::Screensaver => on(self.screensaver),
+            Row::Badges => on(self.badges),
             Row::FpsCounter => on(self.fps_counter),
             Row::AutoCovers => on(self.auto_covers),
             Row::Waves => on(self.waves),
@@ -376,7 +443,13 @@ impl Settings {
             Row::SpoofSite => step(&mut self.spoof_site, SPOOF_SITES.len(), dir),
             Row::Volume => step(&mut self.volume, 11, dir),
             Row::CursorSpeed => step(&mut self.cursor_speed, CURSOR_SPEEDS.len(), dir),
+            Row::MouseSpeed => step(&mut self.mouse_speed, MOUSE_SPEEDS.len(), dir),
             Row::AutoKeyboard => self.auto_keyboard = dir > 0,
+            Row::Theme => step(&mut self.theme, crate::ui::gfx::THEMES.len(), dir),
+            Row::Accent => step(&mut self.accent, ACCENTS.len(), dir),
+            Row::UiSounds => self.ui_sounds = dir > 0,
+            Row::Screensaver => self.screensaver = dir > 0,
+            Row::Badges => self.badges = dir > 0,
             Row::FpsCounter => self.fps_counter = dir > 0,
             Row::AutoCovers => self.auto_covers = dir > 0,
             Row::Waves => self.waves = dir > 0,
@@ -404,5 +477,10 @@ impl Settings {
 
     pub fn cursor_multiplier(&self) -> f64 {
         [0.6, 1.0, 1.5][self.cursor_speed as usize]
+    }
+
+    /// Frame pixels per mouse count.
+    pub fn mouse_multiplier(&self) -> f64 {
+        [0.5, 0.8, 1.2, 1.8, 2.6][self.mouse_speed as usize]
     }
 }

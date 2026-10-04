@@ -49,6 +49,20 @@ impl Ps5AudioBackend {
     }
 }
 
+/// sceAudioOutInit, once per app run: a second call fails (0x8026000e),
+/// which left every game after the first one muted. The menu sounds use it too.
+pub fn init_audio_out() -> Result<(), String> {
+    static INITIALIZED: AtomicBool = AtomicBool::new(false);
+    if !INITIALIZED.load(Ordering::Relaxed) {
+        let ret = unsafe { sceAudioOutInit() };
+        if ret < 0 && ret != 0x8026000e_u32 as i32 {
+            return Err(format!("sceAudioOutInit failed: 0x{:08x}", ret as u32));
+        }
+        INITIALIZED.store(true, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
 pub fn set_volume(handle: &AtomicU32, gain: f32) {
     handle.store(gain.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
 }
@@ -67,16 +81,7 @@ impl Ps5AudioBackend {
     pub fn new() -> Result<Self, String> {
         println!("[PS5] Initializing audio...");
 
-        // Once per app run: a second sceAudioOutInit fails (0x8026000e), which
-        // left every game after the first one muted.
-        static INITIALIZED: AtomicBool = AtomicBool::new(false);
-        if !INITIALIZED.load(Ordering::Relaxed) {
-            let ret = unsafe { sceAudioOutInit() };
-            if ret < 0 && ret != 0x8026000e_u32 as i32 {
-                return Err(format!("sceAudioOutInit failed: 0x{:08x}", ret as u32));
-            }
-            INITIALIZED.store(true, Ordering::Relaxed);
-        }
+        init_audio_out()?;
 
         let handle = unsafe {
             sceAudioOutOpen(

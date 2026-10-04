@@ -44,7 +44,7 @@ You need a PS5 with **kstuff** running and a helper, plus **[ShadowMountPlus](ht
 Download the [latest release](https://github.com/ZiZc3/Ruffle-Flash-PS5/releases), then:
 
 1. Copy the **`PPSA68091`** folder to `/data/homebrew/`.
-2. Load **`Helper.elf`** together with kstuff (no whitelist setup needed).
+2. Load **`Helper.elf`** together with kstuff.
 3. Put all your games (.swf) in `/data/ruffle/games/`.
 4. Start **Ruffle Flash** from the home screen.
 

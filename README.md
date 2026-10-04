@@ -39,12 +39,12 @@
 
 ## Install
 
-You need a PS5 with **kstuff** running and a ruffle-helper, plus **[ShadowMountPlus](https://github.com/drakmor/ShadowMountPlus)**.
+You need a PS5 with **kstuff** running and a helper, plus **[ShadowMountPlus](https://github.com/drakmor/ShadowMountPlus)**.
 
 Download the [latest release](https://github.com/ZiZc3/Ruffle-Flash-PS5/releases), then:
 
 1. Copy the **`PPSA68091`** folder to `/data/homebrew/`.
-2. Load **`ruffle-helper.elf`** together with kstuff.
+2. Load **`Helper.elf`** together with kstuff (no whitelist setup needed).
 3. Put all your games (.swf) in `/data/ruffle/games/`.
 4. Start **Ruffle Flash** from the home screen.
 
@@ -126,7 +126,7 @@ bash ps5/scripts/build.sh
 ```
 
 It downloads Ruffle, applies the patches, builds the app and writes `PPSA68091/` and `PPSA68091.zip`.
-The helper builds with `make` in [`ruffle-helper/`](ruffle-helper) (needs `PS5_PAYLOAD_SDK`).
+The helper builds with `make` in [`helper/`](helper) (needs `PS5_PAYLOAD_SDK`).
 
 ## Credits
 - **[Ruffle](https://github.com/ruffle-rs/ruffle)** and its contributors: the Flash Player emulator.

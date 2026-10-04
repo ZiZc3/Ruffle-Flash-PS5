@@ -1,0 +1,6 @@
+# Extra titles for Helper (/data/whitelist.txt on the PS5).
+# PPSA68091 (Ruffle Flash) and PPSA97358 (XPSemu) are built into the helper
+# itself and always work. Add one extra title ID per line below.
+# Lines starting with '#' are comments.
+# Example:
+# PPSAxxxxx

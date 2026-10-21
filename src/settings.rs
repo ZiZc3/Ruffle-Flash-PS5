@@ -378,7 +378,7 @@ impl Settings {
             ("badges", self.badges as u8),
         ];
         let body: String = fields.iter().map(|(k, v)| format!("{}={}\n", k, v)).collect();
-        if let Err(e) = fs::write(FILE, body) {
+        if let Err(e) = crate::fsutil::write_durably(FILE, body) {
             println!("[Settings] can't write {}: {}", FILE, e);
         }
     }

@@ -392,6 +392,16 @@ impl Library {
                 self.add_game(&path, entry.metadata().map(|m| m.len()).unwrap_or(0));
             }
         }
+        // Two games with one key would share a cover, controls, play time and
+        // saves (same file name in two folders, or names with no Latin
+        // letters: "ゲーム" and "テスト" are both "___"). Those get their path's
+        // hash added; every other game keeps the key it always had.
+        let keys: Vec<String> = self.games.iter().map(|g| g.key.clone()).collect();
+        for g in &mut self.games {
+            if keys.iter().filter(|k| **k == g.key).count() > 1 {
+                g.key = format!("{}-{:08x}", g.key, covers::path_hash(&g.path));
+            }
+        }
         self.games.sort_by_key(|g| g.name.to_lowercase());
         for t in 0..TAB_COUNT {
             let n = self.visible_for(t).len();
@@ -440,7 +450,8 @@ impl Library {
         Live {
             games_played: self.playtime.values().filter(|s| **s > 0).count() as u64,
             library_size: self.games.len() as u64,
-            favorites: self.favorites.len() as u64,
+            // Only favorites still in the library (deleted games don't count).
+            favorites: self.favorites.iter().filter(|p| self.games.iter().any(|g| g.path == **p)).count() as u64,
         }
     }
 
@@ -477,7 +488,7 @@ impl Library {
     pub fn record_session(&mut self, key: &str, s: &Session) {
         *self.playtime.entry(key.to_string()).or_insert(0) += s.secs;
         let body: String = self.playtime.iter().map(|(k, t)| format!("{}\t{}\n", t, k)).collect();
-        if let Err(e) = fs::write(PLAYTIME_FILE, body) {
+        if let Err(e) = crate::fsutil::write_durably(PLAYTIME_FILE, body) {
             println!("[Library] can't write {}: {}", PLAYTIME_FILE, e);
         }
         let st = &mut self.badges.stats;
@@ -511,8 +522,10 @@ impl Library {
         self.recent.retain(|(p, _)| p != path);
         self.recent.insert(0, (path.to_string(), now_secs()));
         self.recent.truncate(30);
+        // It's first in Recent now; keep it highlighted there.
+        self.selected[0] = 0;
         let body: String = self.recent.iter().map(|(p, t)| format!("{}\t{}\n", t, p)).collect();
-        if let Err(e) = fs::write(RECENT_FILE, body) {
+        if let Err(e) = crate::fsutil::write_durably(RECENT_FILE, body) {
             println!("[Library] can't write {}: {}", RECENT_FILE, e);
         }
     }
@@ -527,7 +540,7 @@ impl Library {
             self.toast = Some(("Added to Favorites".into(), Instant::now()));
         }
         let body: String = self.favorites.iter().map(|p| format!("{}\n", p)).collect();
-        if let Err(e) = fs::write(FAVORITES_FILE, body) {
+        if let Err(e) = crate::fsutil::write_durably(FAVORITES_FILE, body) {
             println!("[Library] can't write {}: {}", FAVORITES_FILE, e);
         }
         let n = self.visible_for(self.tab).len();
@@ -937,11 +950,14 @@ impl Library {
         }
         if f.just_pressed(PAD_CIRCLE) || f.just_pressed(PAD_OPTIONS) {
             let ed = self.editor.take().unwrap();
-            ed.controls.save(&ed.key);
-            self.badges.stats.controls += 1;
-            self.badges.save();
-            self.check_badges();
-            self.toast = Some((format!("Controls saved for {}", ed.name), Instant::now()));
+            // Only a real change counts (for the toast and the Remapper badge).
+            if ed.controls != Controls::load(&ed.key) {
+                ed.controls.save(&ed.key);
+                self.badges.stats.controls += 1;
+                self.badges.save();
+                self.check_badges();
+                self.toast = Some((format!("Controls saved for {}", ed.name), Instant::now()));
+            }
         }
     }
 
@@ -1011,7 +1027,7 @@ impl Library {
                 }
                 Row::ClearRecent => {
                     self.recent.clear();
-                    let _ = fs::write(RECENT_FILE, "");
+                    let _ = crate::fsutil::write_durably(RECENT_FILE, "");
                     self.toast = Some(("Recently played cleared".into(), Instant::now()));
                 }
                 Row::About => self.about_page = Some(Instant::now()),

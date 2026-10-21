@@ -16,6 +16,7 @@ mod badges;
 mod covers;
 mod cpu;
 mod display;
+mod fsutil;
 mod hid;
 mod input;
 mod controls;
@@ -57,6 +58,38 @@ const FADE_IN: Duration = Duration::from_millis(350);
 const FADE_OUT: Duration = Duration::from_millis(400);
 /// A game without a cover gets one captured this far into its first run.
 const AUTO_COVER_AFTER: Duration = Duration::from_secs(8);
+/// How often a running game's saves go to disk (only the ones that changed),
+/// so shutting the console down or putting it to rest mid-game keeps them.
+const SAVE_EVERY: Duration = Duration::from_secs(3);
+/// The running game's play time and badge counts so far, kept every
+/// PROGRESS_EVERY: counted at the next start if the game never got to end.
+const PROGRESS_FILE: &str = "/data/ruffle/session.txt";
+const PROGRESS_EVERY: Duration = Duration::from_secs(30);
+
+fn write_progress(key: &str, s: &badges::Session) {
+    let body = format!(
+        "{}\n{} {} {} {} {} {}\n",
+        key, s.secs, s.covers, s.quick_menus, s.restarts, s.keyboard as u8, s.mouse as u8
+    );
+    fsutil::write_in_background(PROGRESS_FILE.into(), body.into_bytes());
+}
+
+fn read_progress() -> Option<(String, badges::Session)> {
+    let text = fs::read_to_string(PROGRESS_FILE).ok()?;
+    let mut lines = text.lines();
+    let key = lines.next()?.to_string();
+    let n: Vec<u64> = lines.next()?.split(' ').map(|v| v.parse().ok()).collect::<Option<_>>()?;
+    let [secs, covers, quick_menus, restarts, keyboard, mouse] = n[..] else { return None };
+    let s = badges::Session {
+        secs,
+        covers: covers as u32,
+        quick_menus: quick_menus as u32,
+        restarts: restarts as u32,
+        keyboard: keyboard != 0,
+        mouse: mouse != 0,
+    };
+    (!key.is_empty()).then_some((key, s))
+}
 /// With this folder present, R3 in a game records CAPTURE_FRAMES frames there.
 const CAPTURE_DIR: &str = "/data/ruffle/capture";
 const CAPTURE_FRAMES: usize = 40;
@@ -342,6 +375,13 @@ fn run() {
         bg: Background::new(theme_background(theme), theme),
     };
 
+    // A game cut off by a shutdown or crash left its progress behind.
+    if let Some((key, session)) = read_progress() {
+        println!("[Ruffle] Counting the last session of {} ({} s)", key, session.secs);
+        library.record_session(&key, &session);
+        let _ = fs::remove_file(PROGRESS_FILE);
+    }
+
     loop {
         stage("game library");
         let path = library_session(&mut app, &mut library);
@@ -356,7 +396,11 @@ fn run() {
             session.restarts += 1;
             library.forget_cover(&key);
         }
-        library.record_session(&key, &session);
+        // The built-in demo isn't a game: no play time or badges for it.
+        if !path.is_empty() {
+            library.record_session(&key, &session);
+        }
+        fsutil::remove_in_background(PROGRESS_FILE.into());
         if settings.volume != library.settings.volume {
             library.settings.volume = settings.volume;
             library.settings.save();
@@ -704,6 +748,8 @@ fn game_session(
     let mut menu_hints = app.input.keyboard_plugged();
     let (mut ticks, mut drawn, mut capture_failed) = (0u64, 0u64, 0u64);
     let mut last_stats = Instant::now();
+    let mut last_save = Instant::now();
+    let mut last_progress = Instant::now();
     // Where a frame's time goes (ms, summed over the 5 s): the game's code,
     // the jobs it started, drawing, reading the picture back, our overlays,
     // and showing it.
@@ -788,7 +834,14 @@ fn game_session(
                 p.handle_event(e);
             }
             p.set_is_playing(false);
+            // The PS button and rest mode are a step away from here.
+            p.flush_shared_objects();
             drop(p);
+            last_save = Instant::now();
+            if !path.is_empty() {
+                let secs = started.elapsed().saturating_sub(paused_for).as_secs();
+                write_progress(key, &badges::Session { secs: session.secs + secs, ..*session });
+            }
             if keyboard.is_open() {
                 keyboard.set_open(false);
             }
@@ -921,6 +974,16 @@ fn game_session(
                     }
                 }
             }
+        }
+
+        if last_save.elapsed() >= SAVE_EVERY {
+            player.lock().expect("player lock").flush_shared_objects();
+            last_save = Instant::now();
+        }
+        if !path.is_empty() && last_progress.elapsed() >= PROGRESS_EVERY {
+            let secs = started.elapsed().saturating_sub(paused_for).as_secs();
+            write_progress(key, &badges::Session { secs: session.secs + secs, ..*session });
+            last_progress = Instant::now();
         }
 
         if last_stats.elapsed() >= Duration::from_secs(5) {

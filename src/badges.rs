@@ -209,14 +209,14 @@ impl Badges {
             ("morning", s.morning),
         ];
         let body: String = fields.iter().map(|(k, v)| format!("{}={}\n", k, v)).collect();
-        let _ = fs::write(STATS_FILE, body);
+        let _ = crate::fsutil::write_durably(STATS_FILE, body);
         let body: String = BADGES
             .iter()
             .zip(self.unlocked.iter())
             .filter(|(_, t)| **t > 0)
             .map(|(b, t)| format!("{}\t{}\n", b.id, t))
             .collect();
-        let _ = fs::write(BADGES_FILE, body);
+        let _ = crate::fsutil::write_durably(BADGES_FILE, body);
     }
 
     pub fn count(&self) -> usize {

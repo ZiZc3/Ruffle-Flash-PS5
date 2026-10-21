@@ -184,7 +184,7 @@ impl Controls {
         for (i, (_, _, f)) in BUTTONS.iter().enumerate() {
             body += &format!("{}={}\n", f, self.binds[i].save_name());
         }
-        if let Err(e) = fs::write(file(game_key), body) {
+        if let Err(e) = crate::fsutil::write_durably(file(game_key), body) {
             println!("[Controls] can't write {}: {}", file(game_key).display(), e);
         }
     }

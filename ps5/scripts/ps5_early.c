@@ -1,8 +1,9 @@
 /*
  * Ruffle Flash PS5 start-up, run from .preinit_array before any constructor or
- * Rust code (ported from XPSemu's ui/xemu-os-utils-ps5.c): HEN jailbreak
- * request, log to /data/ruffle/ruffle.log, unresolved-import report and a
- * crash handler that toasts the eboot offset.
+ * Rust code (ported from XPSemu's ui/xemu-os-utils-ps5.c): log to
+ * /data/ruffle/ruffle.log, unresolved-import report and a crash handler that
+ * toasts the eboot offset. ShadowMountPlus (1.7 beta 4 or later) gives the
+ * app /data; no helper payload or jailbreak request is needed.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -252,62 +253,6 @@ void ruffle_ps5_stage(const char *name)
 {
     stage = name;
     logf_("Ruffle PS5: stage: %s", name);
-}
-
-#define HEN_REQUEST "/download0/etahen_jailbreak"
-#define HEN_REQUEST_STAGED "/download0/etahen_jailbreak.tmp"
-#define HEN_POLL_US 16667
-#define HEN_MAX_POLLS 600
-#define HEN_POST_CONSUME_POLLS 450
-
-static bool hen_jailbreak(char *msg, size_t msg_size)
-{
-    int pid = getpid();
-    int uid_before = geteuid();
-    if (uid_before == 0) {
-        snprintf(msg, msg_size, "already root (pid %d)", pid);
-        return true;
-    }
-
-    char request[32];
-    int len = snprintf(request, sizeof(request), "{\"PID\":%d}\n", pid);
-
-    if ((unlink(HEN_REQUEST) != 0 && errno != ENOENT) ||
-        (unlink(HEN_REQUEST_STAGED) != 0 && errno != ENOENT)) {
-        snprintf(msg, msg_size, "stale request cleanup failed, errno %d", errno);
-        return false;
-    }
-    int fd = open(HEN_REQUEST_STAGED, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
-    if (fd < 0) {
-        snprintf(msg, msg_size, "request open failed, errno %d", errno);
-        return false;
-    }
-    bool ok = fchmod(fd, 0666) == 0 && write(fd, request, len) == len && fsync(fd) == 0;
-    ok = (close(fd) == 0) && ok;
-    if (!ok || rename(HEN_REQUEST_STAGED, HEN_REQUEST) != 0) {
-        snprintf(msg, msg_size, "request write failed, errno %d", errno);
-        unlink(HEN_REQUEST_STAGED);
-        return false;
-    }
-
-    int polls = 0;
-    while (access(HEN_REQUEST, F_OK) == 0) {
-        if (++polls >= HEN_MAX_POLLS) {
-            unlink(HEN_REQUEST);
-            snprintf(msg, msg_size,
-                     "no HEN took the request (pid %d): load the Helper and add "
-                     TITLE_ID " to /data/whitelist.txt", pid);
-            return false;
-        }
-        sceKernelUsleep(HEN_POLL_US);
-    }
-    int uid = geteuid();
-    for (int i = 0; i < HEN_POST_CONSUME_POLLS && uid != 0; i++) {
-        sceKernelUsleep(HEN_POLL_US);
-        uid = geteuid();
-    }
-    snprintf(msg, msg_size, "request taken after %d polls, uid %d -> %d", polls, uid_before, uid);
-    return uid == 0;
 }
 
 static void write_str(const char *s)
@@ -572,7 +517,7 @@ static void report_unresolved_imports(void)
     }
 }
 
-/* Keyboard and mouse sysmodule results from before the jailbreak. */
+/* Keyboard and mouse sysmodule results, loaded first thing. */
 static int hid_preload_rc[2] = { 1, 1 };
 
 static void ruffle_ps5_early_init(void)
@@ -580,15 +525,10 @@ static void ruffle_ps5_early_init(void)
     /* Crashes from here on get a toast, even before /data is reachable. */
     install_crash_handler();
 
-    /* The keyboard and mouse libraries load while the app is still a plain
-     * title: after the helper's authid change the kernel refused them
-     * (load_prx -> 0x63, from sysmodule and from the file alike). */
+    /* The keyboard and mouse libraries load first: with the old helper's
+     * authid change the kernel refused them (load_prx -> 0x63). */
     hid_preload_rc[0] = sceSysmoduleLoadModule(hid_apis[0].sysmodule);
     hid_preload_rc[1] = sceSysmoduleLoadModule(hid_apis[1].sysmodule);
-
-    ruffle_ps5_stage("jailbreak");
-    char jailbreak_msg[192];
-    bool unlocked = hen_jailbreak(jailbreak_msg, sizeof(jailbreak_msg));
 
     mkdir(RUFFLE_DIR, 0777);
     mkdir(RUFFLE_DIR "/games", 0777);
@@ -603,21 +543,17 @@ static void ruffle_ps5_early_init(void)
         rc_err = dup2(log_fd, STDERR_FILENO);
     }
 
-    if (!unlocked || !logging) {
-        char toast[300];
-        snprintf(toast, sizeof(toast), "Ruffle: jailbreak %s: %s%s",
-                 unlocked ? "ok" : "NOT CONFIRMED", jailbreak_msg,
-                 logging ? "" : " (can't write " RUFFLE_LOG ")");
-        notify(toast);
+    if (!logging) {
+        notify("Ruffle can't reach /data: update ShadowMountPlus (1.7 beta 4 or later)");
     }
 
     logf_("Ruffle PS5: load address marker ruffle_ps5_early_init=%p",
           (void *)ruffle_ps5_early_init);
     logf_("Ruffle PS5: log fd %d, dup2 -> 1: %d, -> 2: %d (errno %d)", log_fd, rc_out, rc_err,
           errno);
-    logf_("Ruffle PS5: jailbreak %s: %s", unlocked ? "ok" : "NOT CONFIRMED", jailbreak_msg);
+    logf_("Ruffle PS5: uid %d", geteuid());
     report_unresolved_imports();
-    logf_("Ruffle PS5: before jailbreak: keyboard sysmodule -> %#x, mouse sysmodule -> %#x",
+    logf_("Ruffle PS5: keyboard sysmodule -> %#x, mouse sysmodule -> %#x",
           hid_preload_rc[0], hid_preload_rc[1]);
     /* Rust code runs on a re-installed handler too (it may replace ours). */
     install_crash_handler();

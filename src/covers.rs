@@ -69,7 +69,13 @@ pub fn save_cover(key: &str, frame: &[u8], movie_w: f32, movie_h: f32) -> bool {
     let small = image::imageops::resize(&crop, out_w, out_h.max(1), image::imageops::FilterType::Triangle);
     let _ = fs::create_dir_all(COVERS_DIR);
     let path = PathBuf::from(COVERS_DIR).join(format!("{}.png", key));
-    match small.save_with_format(&path, image::ImageFormat::Png) {
+    // Whole or not at all: a cut-off PNG would count as a cover and never be retaken.
+    let mut png = std::io::Cursor::new(Vec::new());
+    let saved = small
+        .write_to(&mut png, image::ImageFormat::Png)
+        .map_err(|e| e.to_string())
+        .and_then(|()| crate::fsutil::write_durably(&path, png.get_ref()).map_err(|e| e.to_string()));
+    match saved {
         Ok(()) => {
             println!("[Covers] saved {}", path.display());
             true
@@ -79,6 +85,11 @@ pub fn save_cover(key: &str, frame: &[u8], movie_w: f32, movie_h: f32) -> bool {
             false
         }
     }
+}
+
+/// A short, stable tag for a game's full path, to tell apart games whose keys clash.
+pub fn path_hash(path: &str) -> u32 {
+    hash(path) as u32
 }
 
 fn hash(s: &str) -> u64 {

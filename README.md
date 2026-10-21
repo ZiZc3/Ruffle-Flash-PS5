@@ -39,7 +39,7 @@
 
 ## Install
 
-You need a PS5 with **kstuff** running and a helper, plus **[ShadowMountPlus](https://github.com/drakmor/ShadowMountPlus)**.
+You need a PS5 with **kstuff** running and a **[ShadowMountPlus](https://github.com/drakmor/ShadowMountPlus)**.
 
 Download the [latest release](https://github.com/ZiZc3/Ruffle-Flash-PS5/releases), then:
 
